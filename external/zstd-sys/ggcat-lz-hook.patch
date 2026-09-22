@@ -1,0 +1,1176 @@
+--- a/build.rs	2026-09-22 02:36:39.636654440 +0300
++++ b/build.rs	2026-09-22 02:36:39.641694609 +0300
+@@ -2,93 +2,6 @@
+ use std::path::{Path, PathBuf};
+ use std::{env, fmt, fs};
+ 
+-#[cfg(feature = "bindgen")]
+-fn generate_bindings(defs: Vec<&str>, headerpaths: Vec<PathBuf>) {
+-    use bindgen::RustTarget;
+-
+-    let bindings = bindgen::Builder::default().header("zstd.h");
+-
+-    #[cfg(feature = "zdict_builder")]
+-    let bindings = bindings.header("zdict.h");
+-
+-    #[cfg(feature = "seekable")]
+-    let bindings = bindings.header("zstd_seekable.h");
+-
+-    let bindings = bindings
+-        .layout_tests(false)
+-        .blocklist_type("max_align_t")
+-        .size_t_is_usize(true)
+-        .rust_target(
+-            RustTarget::stable(64, 0)
+-                .ok()
+-                .expect("Could not get 1.64.0 version"),
+-        )
+-        .use_core()
+-        .rustified_enum(".*")
+-        .clang_args(
+-            headerpaths
+-                .into_iter()
+-                .map(|path| format!("-I{}", path.display())),
+-        )
+-        .clang_args(defs.into_iter().map(|def| format!("-D{}", def)));
+-
+-    #[cfg(feature = "experimental")]
+-    let bindings = bindings
+-        .clang_arg("-DZSTD_STATIC_LINKING_ONLY")
+-        .clang_arg("-DZDICT_STATIC_LINKING_ONLY")
+-        .clang_arg("-DZSTD_RUST_BINDINGS_EXPERIMENTAL");
+-
+-    #[cfg(feature = "seekable")]
+-    let bindings = bindings.blocklist_function("ZSTD_seekable_initFile");
+-
+-    let bindings = bindings.generate().expect("Unable to generate bindings");
+-
+-    let out_path = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+-    bindings
+-        .write_to_file(out_path.join("bindings.rs"))
+-        .expect("Could not write bindings");
+-}
+-
+-#[cfg(not(feature = "bindgen"))]
+-fn generate_bindings(_: Vec<&str>, _: Vec<PathBuf>) {}
+-
+-fn pkg_config() -> (Vec<&'static str>, Vec<PathBuf>) {
+-    let library = pkg_config::Config::new()
+-        .statik(true)
+-        .cargo_metadata(!cfg!(feature = "non-cargo"))
+-        .probe("libzstd")
+-        .expect("Can't probe for zstd in pkg-config");
+-    (vec!["PKG_CONFIG"], library.include_paths)
+-}
+-
+-#[cfg(not(feature = "legacy"))]
+-fn set_legacy(_config: &mut cc::Build) {}
+-
+-#[cfg(feature = "legacy")]
+-fn set_legacy(config: &mut cc::Build) {
+-    config.define("ZSTD_LEGACY_SUPPORT", Some("1"));
+-    config.include("zstd/lib/legacy");
+-}
+-
+-#[cfg(feature = "zstdmt")]
+-fn set_pthread(config: &mut cc::Build) {
+-    config.flag("-pthread");
+-}
+-
+-#[cfg(not(feature = "zstdmt"))]
+-fn set_pthread(_config: &mut cc::Build) {}
+-
+-#[cfg(feature = "zstdmt")]
+-fn enable_threading(config: &mut cc::Build) {
+-    config.define("ZSTD_MULTITHREAD", Some(""));
+-}
+-
+-#[cfg(not(feature = "zstdmt"))]
+-fn enable_threading(_config: &mut cc::Build) {}
+-
+-/// This function would find the first flag in `flags` that is supported
+-/// and add that to `config`.
+-#[allow(dead_code)]
+ fn flag_if_supported_with_fallbacks(config: &mut cc::Build, flags: &[&str]) {
+     let option = flags
+         .iter()
+@@ -107,12 +20,6 @@
+         "zstd/lib/common",
+         "zstd/lib/compress",
+         "zstd/lib/decompress",
+-        #[cfg(feature = "seekable")]
+-        "zstd/contrib/seekable_format",
+-        #[cfg(feature = "zdict_builder")]
+-        "zstd/lib/dictBuilder",
+-        #[cfg(feature = "legacy")]
+-        "zstd/lib/legacy",
+     ] {
+         let mut entries: Vec<_> = fs::read_dir(dir)
+             .unwrap()
+@@ -182,39 +89,43 @@
+         );
+     }
+ 
+-    #[cfg(feature = "thin")]
+-    {
+-        // Here we try to build a lib as thin/small as possible.
+-        // We cannot use ZSTD_LIB_MINIFY since it is only
+-        // used in Makefile to define other options.
+-
+-        config
+-            .define("HUF_FORCE_DECOMPRESS_X1", Some("1"))
+-            .define("ZSTD_FORCE_DECOMPRESS_SEQUENCES_SHORT", Some("1"))
+-            .define("ZSTD_NO_INLINE", Some("1"))
+-            // removes the error messages that are
+-            // otherwise returned by ZSTD_getErrorName
+-            .define("ZSTD_STRIP_ERROR_STRINGS", Some("1"));
+-
+-        // Disable use of BMI2 instructions since it involves runtime checking
+-        // of the feature and fallback if no BMI2 instruction is detected.
+-        config.define("DYNAMIC_BMI2", Some("0"));
+-
+-        // Disable support for all legacy formats
+-        #[cfg(not(feature = "legacy"))]
+-        config.define("ZSTD_LEGACY_SUPPORT", Some("0"));
++    // lzcb: this fork ships no legacy sources.
++    config.define("ZSTD_LEGACY_SUPPORT", Some("0"));
+ 
+-        config.opt_level_str("z");
++
++    // lzcb: rename every exported C symbol so this fork can be linked into the same
++    // binary as the genuine zstd-sys. Regenerate lzcb_prefix.h with
++    // ../../tools/gen-symbol-prefix.sh after any upstream bump.
++    println!("cargo:rerun-if-changed=lzcb_prefix.h");
++    println!("cargo:rerun-if-env-changed=LZCB_NO_PREFIX");
++    if env::var_os("LZCB_NO_PREFIX").is_none() {
++        let hdr = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
++            .join("lzcb_prefix.h");
++        assert!(
++            hdr.exists(),
++            "lzcb_prefix.h is missing; run tools/gen-symbol-prefix.sh"
++        );
++        let hdr = hdr.to_str().expect("non-UTF-8 manifest dir");
++        // Never flag_if_supported here: a silently dropped flag brings the symbol
++        // collision back with no diagnostic. The joined -includeFILE form is a single
++        // argv element, so it can never be separated from its argument.
++        let msvc = config.try_get_compiler().map(|c| c.is_like_msvc()).unwrap_or(false);
++        if msvc {
++            config.flag(format!("/FI{hdr}"));
++        } else {
++            config.flag(format!("-include{hdr}"));
++        }
+     }
+ 
++    // lzcb: so the `#include "lzcb_prefix.h"` added to zstd_common.c resolves.
++    config.include(env::current_dir().unwrap());
++
+     // Hide symbols from resulting library,
+     // so we can be used with another zstd-linking lib.
+     // See https://github.com/gyscos/zstd-rs/issues/58
+     config.flag("-fvisibility=hidden");
+     config.define("XXH_PRIVATE_API", Some(""));
+     config.define("ZSTDLIB_VISIBILITY", Some(""));
+-    #[cfg(feature = "zdict_builder")]
+-    config.define("ZDICTLIB_VISIBILITY", Some(""));
+     config.define("ZSTDERRORLIB_VISIBILITY", Some(""));
+ 
+     // https://github.com/facebook/zstd/blob/d69d08ed6c83563b57d98132e1e3f2487880781e/lib/common/debug.h#L60
+@@ -228,15 +139,6 @@
+      * 6 : events once per sequence (verbose)
+      * 7+: events at every position (*very* verbose)
+      */
+-    #[cfg(feature = "debug")]
+-    if !need_wasm_shim {
+-        config.define("DEBUGLEVEL", Some("5"));
+-    }
+-
+-    set_pthread(&mut config);
+-    set_legacy(&mut config);
+-    enable_threading(&mut config);
+-
+     // Compile!
+     config.compile("libzstd.a");
+ 
+@@ -247,22 +149,20 @@
+     fs::copy(src.join("zstd.h"), include.join("zstd.h")).unwrap();
+     fs::copy(src.join("zstd_errors.h"), include.join("zstd_errors.h"))
+         .unwrap();
+-    #[cfg(feature = "zdict_builder")]
+-    fs::copy(src.join("zdict.h"), include.join("zdict.h")).unwrap();
+     cargo_print(&format_args!("root={}", dst.display()));
+ }
+ 
+ /// Print a line for cargo.
+-///
+-/// If non-cargo is set, do not print anything.
+ fn cargo_print(content: &dyn fmt::Display) {
+-    if cfg!(not(feature = "non-cargo")) {
+-        println!("cargo:{}", content);
+-    }
++    println!("cargo:{}", content);
+ }
+ 
+ fn main() {
+-    cargo_print(&"rerun-if-env-changed=ZSTD_SYS_USE_PKG_CONFIG");
++    // ggcat: the vendored decoder carries the LZ match hook patch.
++    println!("cargo:rerun-if-changed=zstd/lib/decompress/zstd_decompress.c");
++    println!("cargo:rerun-if-changed=zstd/lib/decompress/zstd_decompress_block.c");
++    println!("cargo:rerun-if-changed=zstd/lib/decompress/zstd_decompress_internal.h");
++    println!("cargo:rerun-if-changed=zstd/lib/common/zstd_common.c");
+ 
+     let target_arch =
+         std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+@@ -273,29 +173,22 @@
+     }
+ 
+     // println!("cargo:rustc-link-lib=zstd");
+-    let (defs, headerpaths) = if cfg!(feature = "pkg-config")
+-        || env::var_os("ZSTD_SYS_USE_PKG_CONFIG").is_some()
+-    {
+-        pkg_config()
+-    } else {
+-        if !Path::new("zstd/lib").exists() {
+-            panic!("Folder 'zstd/lib' does not exists. Maybe you forgot to clone the 'zstd' submodule?");
+-        }
+-
+-        let manifest_dir = PathBuf::from(
+-            env::var_os("CARGO_MANIFEST_DIR")
+-                .expect("Manifest dir is always set by cargo"),
+-        );
+-
+-        compile_zstd();
+-        (vec![], vec![manifest_dir.join("zstd/lib")])
+-    };
++    // lzcb: this fork carries the LZ match hook, so the bundled source is always
++    // built; a system libzstd would lack ZSTD_DCtx_setLzMatchHook. Upstream's
++    // pkg-config path is deliberately gone.
++    if !Path::new("zstd/lib").exists() {
++        panic!("Folder 'zstd/lib' does not exist.");
++    }
++    let manifest_dir = PathBuf::from(
++        env::var_os("CARGO_MANIFEST_DIR")
++            .expect("Manifest dir is always set by cargo"),
++    );
++    compile_zstd();
++    let headerpaths = vec![manifest_dir.join("zstd/lib")];
+ 
+     let includes: Vec<_> = headerpaths
+         .iter()
+         .map(|p| p.display().to_string())
+         .collect();
+     cargo_print(&format_args!("include={}", includes.join(";")));
+-
+-    generate_bindings(defs, headerpaths);
+ }
+--- a/Cargo.toml	2026-09-22 02:36:39.636522130 +0300
++++ b/Cargo.toml	2026-09-22 02:36:39.641553091 +0300
+@@ -1,27 +1,21 @@
+-# THIS FILE IS AUTOMATICALLY GENERATED BY CARGO
+-#
+-# When uploading crates to the registry Cargo will automatically
+-# "normalize" Cargo.toml files for maximal compatibility
+-# with all versions of Cargo and also rewrite `path` dependencies
+-# to registry (e.g., crates.io) dependencies.
+-#
+-# If you are reading this file be aware that the original Cargo.toml
+-# will likely look very different (and much more reasonable).
+-# See Cargo.toml.orig for the original contents.
++# Vendored copy of zstd-sys 2.0.16+zstd.1.5.7 with the ggcat LZ match hook (see PATCH.md).
+ 
+ [package]
+ edition = "2018"
+ rust-version = "1.64"
+-name = "zstd-sys"
+-version = "2.0.16+zstd.1.5.7"
++name = "lzcb-zstd-sys"
++version = "0.1.0+zstd.1.5.7"
+ authors = ["Alexandre Bury <alexandre.bury@gmail.com>"]
+ build = "build.rs"
+-links = "zstd"
++links = "lzcb_zstd"
+ include = [
+     "/LICENSE*",
+     "!/*.sh",
+     "/build.rs",
+     "/*.h",
++    "/lzcb_prefix.h",
++    "/PATCH.md",
++    "/ggcat-lz-hook.patch",
+     "/src/",
+     "/wasm-shim/**/*.h",
+     "/zstd/LICENSE",
+@@ -29,15 +23,13 @@
+     "/zstd/lib/**/*.c",
+     "/zstd/lib/**/*.h",
+     "/zstd/lib/**/*.S",
+-    "/zstd/contrib/seekable_format/*.c",
+-    "/zstd/contrib/seekable_format/*.h",
+ ]
+ autolib = false
+ autobins = false
+ autoexamples = false
+ autotests = false
+ autobenches = false
+-description = "Low-level bindings for the zstd compression library."
++description = "Fork of zstd-sys 2.0.16 (zstd 1.5.7) whose decoder reports every LZ match through a hook and whose C symbols are prefixed, for the lz-copyback crate."
+ readme = "Readme.md"
+ keywords = [
+     "zstd",
+@@ -48,50 +40,32 @@
+     "api-bindings",
+     "compression",
+ ]
+-license = "MIT/Apache-2.0"
+-repository = "https://github.com/gyscos/zstd-rs"
+-
+-[package.metadata.docs.rs]
+-features = ["experimental"]
++license = "MIT OR Apache-2.0"
++repository = "https://github.com/algbio/ggcat"
++# upstream: "https://github.com/gyscos/zstd-rs"
+ 
+ [features]
+-debug = []
+-default = [
+-    "legacy",
+-    "zdict_builder",
+-    "bindgen",
+-]
+-experimental = []
++default = []
+ fat-lto = []
+-legacy = []
+ no_asm = []
+ no_wasm_shim = []
+-non-cargo = []
+-pkg-config = []
+-seekable = []
+ std = []
+-thin = []
+ thin-lto = []
+-zdict_builder = []
+-zstdmt = []
+ 
+ [lib]
+-name = "zstd_sys"
++name = "lzcb_zstd_sys"
+ path = "src/lib.rs"
+ doctest = false
+ 
+-[build-dependencies.bindgen]
+-version = "0.72"
+-features = ["runtime"]
+-optional = true
+-default-features = false
+-
+ [build-dependencies.cc]
+ version = "1.0.45"
+ features = ["parallel"]
+ 
+-[build-dependencies.pkg-config]
+-version = "0.3.28"
+-
+ [lints.rust]
+ non_upper_case_globals = "allow"
++[[test]]
++name = "symbols"
++path = "tests/symbols.rs"
++
++[dev-dependencies.object]
++version = "0.37"
+--- a/src/bindings_zstd.rs	2026-09-22 02:36:39.636766653 +0300
++++ b/src/bindings_zstd.rs	2026-09-22 02:36:39.641745976 +0300
+@@ -89,20 +89,24 @@
+     ZSTD_error_maxCode = 120,
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_getErrorString"]
+     pub fn ZSTD_getErrorString(
+         code: ZSTD_ErrorCode,
+     ) -> *const ::core::ffi::c_char;
+ }
+ extern "C" {
+     #[doc = " ZSTD_versionNumber() :\n  Return runtime library version, the value is (MAJOR*100*100 + MINOR*100 + RELEASE)."]
++    #[link_name = "lzcb_ZSTD_versionNumber"]
+     pub fn ZSTD_versionNumber() -> ::core::ffi::c_uint;
+ }
+ extern "C" {
+     #[doc = " ZSTD_versionString() :\n  Return runtime library version, like \"1.4.5\". Requires v1.3.0+."]
++    #[link_name = "lzcb_ZSTD_versionString"]
+     pub fn ZSTD_versionString() -> *const ::core::ffi::c_char;
+ }
+ extern "C" {
+     #[doc = "  Simple Core API\n/\n/*! ZSTD_compress() :\n  Compresses `src` content as a single zstd compressed frame into already allocated `dst`.\n  NOTE: Providing `dstCapacity >= ZSTD_compressBound(srcSize)` guarantees that zstd will have\n        enough space to successfully compress the data.\n  @return : compressed size written into `dst` (<= `dstCapacity),\n            or an error code if it fails (which can be tested using ZSTD_isError())."]
++    #[link_name = "lzcb_ZSTD_compress"]
+     pub fn ZSTD_compress(
+         dst: *mut ::core::ffi::c_void,
+         dstCapacity: usize,
+@@ -113,6 +117,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_decompress() :\n `compressedSize` : must be the _exact_ size of some number of compressed and/or skippable frames.\n  Multiple compressed frames can be decompressed at once with this method.\n  The result will be the concatenation of all decompressed frames, back to back.\n `dstCapacity` is an upper bound of originalSize to regenerate.\n  First frame's decompressed size can be extracted using ZSTD_getFrameContentSize().\n  If maximum upper bound isn't known, prefer using streaming mode to decompress data.\n @return : the number of bytes decompressed into `dst` (<= `dstCapacity`),\n           or an errorCode if it fails (which can be tested using ZSTD_isError())."]
++    #[link_name = "lzcb_ZSTD_decompress"]
+     pub fn ZSTD_decompress(
+         dst: *mut ::core::ffi::c_void,
+         dstCapacity: usize,
+@@ -121,6 +126,7 @@
+     ) -> usize;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_getFrameContentSize"]
+     pub fn ZSTD_getFrameContentSize(
+         src: *const ::core::ffi::c_void,
+         srcSize: usize,
+@@ -128,6 +134,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_getDecompressedSize() (obsolete):\n  This function is now obsolete, in favor of ZSTD_getFrameContentSize().\n  Both functions work the same way, but ZSTD_getDecompressedSize() blends\n  \"empty\", \"unknown\" and \"error\" results to the same return value (0),\n  while ZSTD_getFrameContentSize() gives them separate return values.\n @return : decompressed size of `src` frame content _if known and not empty_, 0 otherwise."]
++    #[link_name = "lzcb_ZSTD_getDecompressedSize"]
+     pub fn ZSTD_getDecompressedSize(
+         src: *const ::core::ffi::c_void,
+         srcSize: usize,
+@@ -135,30 +142,38 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_findFrameCompressedSize() : Requires v1.4.0+\n `src` should point to the start of a ZSTD frame or skippable frame.\n `srcSize` must be >= first frame size\n @return : the compressed size of the first frame starting at `src`,\n           suitable to pass as `srcSize` to `ZSTD_decompress` or similar,\n           or an error code if input is invalid\n  Note 1: this method is called _find*() because it's not enough to read the header,\n          it may have to scan through the frame's content, to reach its end.\n  Note 2: this method also works with Skippable Frames. In which case,\n          it returns the size of the complete skippable frame,\n          which is always equal to its content size + 8 bytes for headers."]
++    #[link_name = "lzcb_ZSTD_findFrameCompressedSize"]
+     pub fn ZSTD_findFrameCompressedSize(
+         src: *const ::core::ffi::c_void,
+         srcSize: usize,
+     ) -> usize;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_compressBound"]
+     pub fn ZSTD_compressBound(srcSize: usize) -> usize;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_isError"]
+     pub fn ZSTD_isError(result: usize) -> ::core::ffi::c_uint;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_getErrorCode"]
+     pub fn ZSTD_getErrorCode(functionResult: usize) -> ZSTD_ErrorCode;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_getErrorName"]
+     pub fn ZSTD_getErrorName(result: usize) -> *const ::core::ffi::c_char;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_minCLevel"]
+     pub fn ZSTD_minCLevel() -> ::core::ffi::c_int;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_maxCLevel"]
+     pub fn ZSTD_maxCLevel() -> ::core::ffi::c_int;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_defaultCLevel"]
+     pub fn ZSTD_defaultCLevel() -> ::core::ffi::c_int;
+ }
+ #[repr(C)]
+@@ -169,13 +184,16 @@
+ #[doc = "  Explicit context"]
+ pub type ZSTD_CCtx = ZSTD_CCtx_s;
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_createCCtx"]
+     pub fn ZSTD_createCCtx() -> *mut ZSTD_CCtx;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_freeCCtx"]
+     pub fn ZSTD_freeCCtx(cctx: *mut ZSTD_CCtx) -> usize;
+ }
+ extern "C" {
+     #[doc = " ZSTD_compressCCtx() :\n  Same as ZSTD_compress(), using an explicit ZSTD_CCtx.\n  Important : in order to mirror `ZSTD_compress()` behavior,\n  this function compresses at the requested compression level,\n  __ignoring any other advanced parameter__ .\n  If any advanced parameter was set using the advanced API,\n  they will all be reset. Only @compressionLevel remains."]
++    #[link_name = "lzcb_ZSTD_compressCCtx"]
+     pub fn ZSTD_compressCCtx(
+         cctx: *mut ZSTD_CCtx,
+         dst: *mut ::core::ffi::c_void,
+@@ -192,13 +210,16 @@
+ }
+ pub type ZSTD_DCtx = ZSTD_DCtx_s;
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_createDCtx"]
+     pub fn ZSTD_createDCtx() -> *mut ZSTD_DCtx;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_freeDCtx"]
+     pub fn ZSTD_freeDCtx(dctx: *mut ZSTD_DCtx) -> usize;
+ }
+ extern "C" {
+     #[doc = " ZSTD_decompressDCtx() :\n  Same as ZSTD_decompress(),\n  requires an allocated ZSTD_DCtx.\n  Compatible with sticky parameters (see below)."]
++    #[link_name = "lzcb_ZSTD_decompressDCtx"]
+     pub fn ZSTD_decompressDCtx(
+         dctx: *mut ZSTD_DCtx,
+         dst: *mut ::core::ffi::c_void,
+@@ -273,10 +294,12 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_cParam_getBounds() :\n  All parameters must belong to an interval with lower and upper bounds,\n  otherwise they will either trigger an error or be automatically clamped.\n @return : a structure, ZSTD_bounds, which contains\n         - an error status field, which must be tested using ZSTD_isError()\n         - lower and upper bounds, both inclusive"]
++    #[link_name = "lzcb_ZSTD_cParam_getBounds"]
+     pub fn ZSTD_cParam_getBounds(cParam: ZSTD_cParameter) -> ZSTD_bounds;
+ }
+ extern "C" {
+     #[doc = " ZSTD_CCtx_setParameter() :\n  Set one compression parameter, selected by enum ZSTD_cParameter.\n  All parameters have valid bounds. Bounds can be queried using ZSTD_cParam_getBounds().\n  Providing a value beyond bound will either clamp it, or trigger an error (depending on parameter).\n  Setting a parameter is generally only possible during frame initialization (before starting compression).\n  Exception : when using multi-threading mode (nbWorkers >= 1),\n              the following parameters can be updated _during_ compression (within same frame):\n              => compressionLevel, hashLog, chainLog, searchLog, minMatch, targetLength and strategy.\n              new parameters will be active for next job only (after a flush()).\n @return : an error code (which can be tested using ZSTD_isError())."]
++    #[link_name = "lzcb_ZSTD_CCtx_setParameter"]
+     pub fn ZSTD_CCtx_setParameter(
+         cctx: *mut ZSTD_CCtx,
+         param: ZSTD_cParameter,
+@@ -285,6 +308,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_CCtx_setPledgedSrcSize() :\n  Total input data size to be compressed as a single frame.\n  Value will be written in frame header, unless if explicitly forbidden using ZSTD_c_contentSizeFlag.\n  This value will also be controlled at end of frame, and trigger an error if not respected.\n @result : 0, or an error code (which can be tested with ZSTD_isError()).\n  Note 1 : pledgedSrcSize==0 actually means zero, aka an empty frame.\n           In order to mean \"unknown content size\", pass constant ZSTD_CONTENTSIZE_UNKNOWN.\n           ZSTD_CONTENTSIZE_UNKNOWN is default value for any new frame.\n  Note 2 : pledgedSrcSize is only valid once, for the next frame.\n           It's discarded at the end of the frame, and replaced by ZSTD_CONTENTSIZE_UNKNOWN.\n  Note 3 : Whenever all input data is provided and consumed in a single round,\n           for example with ZSTD_compress2(),\n           or invoking immediately ZSTD_compressStream2(,,,ZSTD_e_end),\n           this value is automatically overridden by srcSize instead."]
++    #[link_name = "lzcb_ZSTD_CCtx_setPledgedSrcSize"]
+     pub fn ZSTD_CCtx_setPledgedSrcSize(
+         cctx: *mut ZSTD_CCtx,
+         pledgedSrcSize: ::core::ffi::c_ulonglong,
+@@ -299,6 +323,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_CCtx_reset() :\n  There are 2 different things that can be reset, independently or jointly :\n  - The session : will stop compressing current frame, and make CCtx ready to start a new one.\n                  Useful after an error, or to interrupt any ongoing compression.\n                  Any internal data not yet flushed is cancelled.\n                  Compression parameters and dictionary remain unchanged.\n                  They will be used to compress next frame.\n                  Resetting session never fails.\n  - The parameters : changes all parameters back to \"default\".\n                  This also removes any reference to any dictionary or external sequence producer.\n                  Parameters can only be changed between 2 sessions (i.e. no compression is currently ongoing)\n                  otherwise the reset fails, and function returns an error value (which can be tested using ZSTD_isError())\n  - Both : similar to resetting the session, followed by resetting parameters."]
++    #[link_name = "lzcb_ZSTD_CCtx_reset"]
+     pub fn ZSTD_CCtx_reset(
+         cctx: *mut ZSTD_CCtx,
+         reset: ZSTD_ResetDirective,
+@@ -306,6 +331,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_compress2() :\n  Behave the same as ZSTD_compressCCtx(), but compression parameters are set using the advanced API.\n  (note that this entry point doesn't even expose a compression level parameter).\n  ZSTD_compress2() always starts a new frame.\n  Should cctx hold data from a previously unfinished frame, everything about it is forgotten.\n  - Compression parameters are pushed into CCtx before starting compression, using ZSTD_CCtx_set*()\n  - The function is always blocking, returns when compression is completed.\n  NOTE: Providing `dstCapacity >= ZSTD_compressBound(srcSize)` guarantees that zstd will have\n        enough space to successfully compress the data, though it is possible it fails for other reasons.\n @return : compressed size written into `dst` (<= `dstCapacity),\n           or an error code if it fails (which can be tested using ZSTD_isError())."]
++    #[link_name = "lzcb_ZSTD_compress2"]
+     pub fn ZSTD_compress2(
+         cctx: *mut ZSTD_CCtx,
+         dst: *mut ::core::ffi::c_void,
+@@ -328,10 +354,12 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_dParam_getBounds() :\n  All parameters must belong to an interval with lower and upper bounds,\n  otherwise they will either trigger an error or be automatically clamped.\n @return : a structure, ZSTD_bounds, which contains\n         - an error status field, which must be tested using ZSTD_isError()\n         - both lower and upper bounds, inclusive"]
++    #[link_name = "lzcb_ZSTD_dParam_getBounds"]
+     pub fn ZSTD_dParam_getBounds(dParam: ZSTD_dParameter) -> ZSTD_bounds;
+ }
+ extern "C" {
+     #[doc = " ZSTD_DCtx_setParameter() :\n  Set one compression parameter, selected by enum ZSTD_dParameter.\n  All parameters have valid bounds. Bounds can be queried using ZSTD_dParam_getBounds().\n  Providing a value beyond bound will either clamp it, or trigger an error (depending on parameter).\n  Setting a parameter is only possible during frame initialization (before starting decompression).\n @return : 0, or an error code (which can be tested using ZSTD_isError())."]
++    #[link_name = "lzcb_ZSTD_DCtx_setParameter"]
+     pub fn ZSTD_DCtx_setParameter(
+         dctx: *mut ZSTD_DCtx,
+         param: ZSTD_dParameter,
+@@ -340,6 +368,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_DCtx_reset() :\n  Return a DCtx to clean state.\n  Session and parameters can be reset jointly or separately.\n  Parameters can only be reset when no active frame is being decompressed.\n @return : 0, or an error code, which can be tested with ZSTD_isError()"]
++    #[link_name = "lzcb_ZSTD_DCtx_reset"]
+     pub fn ZSTD_DCtx_reset(
+         dctx: *mut ZSTD_DCtx,
+         reset: ZSTD_ResetDirective,
+@@ -371,9 +400,11 @@
+ pub type ZSTD_outBuffer = ZSTD_outBuffer_s;
+ pub type ZSTD_CStream = ZSTD_CCtx;
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_createCStream"]
+     pub fn ZSTD_createCStream() -> *mut ZSTD_CStream;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_freeCStream"]
+     pub fn ZSTD_freeCStream(zcs: *mut ZSTD_CStream) -> usize;
+ }
+ #[repr(u32)]
+@@ -385,6 +416,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_compressStream2() : Requires v1.4.0+\n  Behaves about the same as ZSTD_compressStream, with additional control on end directive.\n  - Compression parameters are pushed into CCtx before starting compression, using ZSTD_CCtx_set*()\n  - Compression parameters cannot be changed once compression is started (save a list of exceptions in multi-threading mode)\n  - output->pos must be <= dstCapacity, input->pos must be <= srcSize\n  - output->pos and input->pos will be updated. They are guaranteed to remain below their respective limit.\n  - endOp must be a valid directive\n  - When nbWorkers==0 (default), function is blocking : it completes its job before returning to caller.\n  - When nbWorkers>=1, function is non-blocking : it copies a portion of input, distributes jobs to internal worker threads, flush to output whatever is available,\n                                                  and then immediately returns, just indicating that there is some data remaining to be flushed.\n                                                  The function nonetheless guarantees forward progress : it will return only after it reads or write at least 1+ byte.\n  - Exception : if the first call requests a ZSTD_e_end directive and provides enough dstCapacity, the function delegates to ZSTD_compress2() which is always blocking.\n  - @return provides a minimum amount of data remaining to be flushed from internal buffers\n            or an error code, which can be tested using ZSTD_isError().\n            if @return != 0, flush is not fully completed, there is still some data left within internal buffers.\n            This is useful for ZSTD_e_flush, since in this case more flushes are necessary to empty all buffers.\n            For ZSTD_e_end, @return == 0 when internal buffers are fully flushed and frame is completed.\n  - after a ZSTD_e_end directive, if internal buffer is not fully flushed (@return != 0),\n            only ZSTD_e_end or ZSTD_e_flush operations are allowed.\n            Before starting a new compression job, or changing compression parameters,\n            it is required to fully flush internal buffers.\n  - note: if an operation ends with an error, it may leave @cctx in an undefined state.\n          Therefore, it's UB to invoke ZSTD_compressStream2() of ZSTD_compressStream() on such a state.\n          In order to be re-employed after an error, a state must be reset,\n          which can be done explicitly (ZSTD_CCtx_reset()),\n          or is sometimes implied by methods starting a new compression job (ZSTD_initCStream(), ZSTD_compressCCtx())"]
++    #[link_name = "lzcb_ZSTD_compressStream2"]
+     pub fn ZSTD_compressStream2(
+         cctx: *mut ZSTD_CCtx,
+         output: *mut ZSTD_outBuffer,
+@@ -393,13 +425,16 @@
+     ) -> usize;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_CStreamInSize"]
+     pub fn ZSTD_CStreamInSize() -> usize;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_CStreamOutSize"]
+     pub fn ZSTD_CStreamOutSize() -> usize;
+ }
+ extern "C" {
+     #[doc = " Equivalent to:\n\n     ZSTD_CCtx_reset(zcs, ZSTD_reset_session_only);\n     ZSTD_CCtx_refCDict(zcs, NULL); // clear the dictionary (if any)\n     ZSTD_CCtx_setParameter(zcs, ZSTD_c_compressionLevel, compressionLevel);\n\n Note that ZSTD_initCStream() clears any previously set dictionary. Use the new API\n to compress with a dictionary."]
++    #[link_name = "lzcb_ZSTD_initCStream"]
+     pub fn ZSTD_initCStream(
+         zcs: *mut ZSTD_CStream,
+         compressionLevel: ::core::ffi::c_int,
+@@ -407,6 +442,7 @@
+ }
+ extern "C" {
+     #[doc = " Alternative for ZSTD_compressStream2(zcs, output, input, ZSTD_e_continue).\n NOTE: The return value is different. ZSTD_compressStream() returns a hint for\n the next read size (if non-zero and not an error). ZSTD_compressStream2()\n returns the minimum nb of bytes left to flush (if non-zero and not an error)."]
++    #[link_name = "lzcb_ZSTD_compressStream"]
+     pub fn ZSTD_compressStream(
+         zcs: *mut ZSTD_CStream,
+         output: *mut ZSTD_outBuffer,
+@@ -415,6 +451,7 @@
+ }
+ extern "C" {
+     #[doc = " Equivalent to ZSTD_compressStream2(zcs, output, &emptyInput, ZSTD_e_flush)."]
++    #[link_name = "lzcb_ZSTD_flushStream"]
+     pub fn ZSTD_flushStream(
+         zcs: *mut ZSTD_CStream,
+         output: *mut ZSTD_outBuffer,
+@@ -422,6 +459,7 @@
+ }
+ extern "C" {
+     #[doc = " Equivalent to ZSTD_compressStream2(zcs, output, &emptyInput, ZSTD_e_end)."]
++    #[link_name = "lzcb_ZSTD_endStream"]
+     pub fn ZSTD_endStream(
+         zcs: *mut ZSTD_CStream,
+         output: *mut ZSTD_outBuffer,
+@@ -429,17 +467,21 @@
+ }
+ pub type ZSTD_DStream = ZSTD_DCtx;
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_createDStream"]
+     pub fn ZSTD_createDStream() -> *mut ZSTD_DStream;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_freeDStream"]
+     pub fn ZSTD_freeDStream(zds: *mut ZSTD_DStream) -> usize;
+ }
+ extern "C" {
+     #[doc = " ZSTD_initDStream() :\n Initialize/reset DStream state for new decompression operation.\n Call before new decompression operation using same DStream.\n\n Note : This function is redundant with the advanced API and equivalent to:\n     ZSTD_DCtx_reset(zds, ZSTD_reset_session_only);\n     ZSTD_DCtx_refDDict(zds, NULL);"]
++    #[link_name = "lzcb_ZSTD_initDStream"]
+     pub fn ZSTD_initDStream(zds: *mut ZSTD_DStream) -> usize;
+ }
+ extern "C" {
+     #[doc = " ZSTD_decompressStream() :\n Streaming decompression function.\n Call repetitively to consume full input updating it as necessary.\n Function will update both input and output `pos` fields exposing current state via these fields:\n - `input.pos < input.size`, some input remaining and caller should provide remaining input\n   on the next call.\n - `output.pos < output.size`, decoder flushed internal output buffer.\n - `output.pos == output.size`, unflushed data potentially present in the internal buffers,\n   check ZSTD_decompressStream() @return value,\n   if > 0, invoke it again to flush remaining data to output.\n Note : with no additional input, amount of data flushed <= ZSTD_BLOCKSIZE_MAX.\n\n @return : 0 when a frame is completely decoded and fully flushed,\n           or an error code, which can be tested using ZSTD_isError(),\n           or any other value > 0, which means there is some decoding or flushing to do to complete current frame.\n\n Note: when an operation returns with an error code, the @zds state may be left in undefined state.\n       It's UB to invoke `ZSTD_decompressStream()` on such a state.\n       In order to re-use such a state, it must be first reset,\n       which can be done explicitly (`ZSTD_DCtx_reset()`),\n       or is implied for operations starting some new decompression job (`ZSTD_initDStream`, `ZSTD_decompressDCtx()`, `ZSTD_decompress_usingDict()`)"]
++    #[link_name = "lzcb_ZSTD_decompressStream"]
+     pub fn ZSTD_decompressStream(
+         zds: *mut ZSTD_DStream,
+         output: *mut ZSTD_outBuffer,
+@@ -447,13 +489,16 @@
+     ) -> usize;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_DStreamInSize"]
+     pub fn ZSTD_DStreamInSize() -> usize;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_DStreamOutSize"]
+     pub fn ZSTD_DStreamOutSize() -> usize;
+ }
+ extern "C" {
+     #[doc = "  Simple dictionary API\n/\n/*! ZSTD_compress_usingDict() :\n  Compression at an explicit compression level using a Dictionary.\n  A dictionary can be any arbitrary data segment (also called a prefix),\n  or a buffer with specified information (see zdict.h).\n  Note : This function loads the dictionary, resulting in significant startup delay.\n         It's intended for a dictionary used only once.\n  Note 2 : When `dict == NULL || dictSize < 8` no dictionary is used."]
++    #[link_name = "lzcb_ZSTD_compress_usingDict"]
+     pub fn ZSTD_compress_usingDict(
+         ctx: *mut ZSTD_CCtx,
+         dst: *mut ::core::ffi::c_void,
+@@ -467,6 +512,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_decompress_usingDict() :\n  Decompression using a known Dictionary.\n  Dictionary must be identical to the one used during compression.\n  Note : This function loads the dictionary, resulting in significant startup delay.\n         It's intended for a dictionary used only once.\n  Note : When `dict == NULL || dictSize < 8` no dictionary is used."]
++    #[link_name = "lzcb_ZSTD_decompress_usingDict"]
+     pub fn ZSTD_decompress_usingDict(
+         dctx: *mut ZSTD_DCtx,
+         dst: *mut ::core::ffi::c_void,
+@@ -486,6 +532,7 @@
+ pub type ZSTD_CDict = ZSTD_CDict_s;
+ extern "C" {
+     #[doc = " ZSTD_createCDict() :\n  When compressing multiple messages or blocks using the same dictionary,\n  it's recommended to digest the dictionary only once, since it's a costly operation.\n  ZSTD_createCDict() will create a state from digesting a dictionary.\n  The resulting state can be used for future compression operations with very limited startup cost.\n  ZSTD_CDict can be created once and shared by multiple threads concurrently, since its usage is read-only.\n @dictBuffer can be released after ZSTD_CDict creation, because its content is copied within CDict.\n  Note 1 : Consider experimental function `ZSTD_createCDict_byReference()` if you prefer to not duplicate @dictBuffer content.\n  Note 2 : A ZSTD_CDict can be created from an empty @dictBuffer,\n      in which case the only thing that it transports is the @compressionLevel.\n      This can be useful in a pipeline featuring ZSTD_compress_usingCDict() exclusively,\n      expecting a ZSTD_CDict parameter with any data, including those without a known dictionary."]
++    #[link_name = "lzcb_ZSTD_createCDict"]
+     pub fn ZSTD_createCDict(
+         dictBuffer: *const ::core::ffi::c_void,
+         dictSize: usize,
+@@ -494,10 +541,12 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_freeCDict() :\n  Function frees memory allocated by ZSTD_createCDict().\n  If a NULL pointer is passed, no operation is performed."]
++    #[link_name = "lzcb_ZSTD_freeCDict"]
+     pub fn ZSTD_freeCDict(CDict: *mut ZSTD_CDict) -> usize;
+ }
+ extern "C" {
+     #[doc = " ZSTD_compress_usingCDict() :\n  Compression using a digested Dictionary.\n  Recommended when same dictionary is used multiple times.\n  Note : compression level is _decided at dictionary creation time_,\n     and frame parameters are hardcoded (dictID=yes, contentSize=yes, checksum=no)"]
++    #[link_name = "lzcb_ZSTD_compress_usingCDict"]
+     pub fn ZSTD_compress_usingCDict(
+         cctx: *mut ZSTD_CCtx,
+         dst: *mut ::core::ffi::c_void,
+@@ -515,6 +564,7 @@
+ pub type ZSTD_DDict = ZSTD_DDict_s;
+ extern "C" {
+     #[doc = " ZSTD_createDDict() :\n  Create a digested dictionary, ready to start decompression operation without startup delay.\n  dictBuffer can be released after DDict creation, as its content is copied inside DDict."]
++    #[link_name = "lzcb_ZSTD_createDDict"]
+     pub fn ZSTD_createDDict(
+         dictBuffer: *const ::core::ffi::c_void,
+         dictSize: usize,
+@@ -522,10 +572,12 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_freeDDict() :\n  Function frees memory allocated with ZSTD_createDDict()\n  If a NULL pointer is passed, no operation is performed."]
++    #[link_name = "lzcb_ZSTD_freeDDict"]
+     pub fn ZSTD_freeDDict(ddict: *mut ZSTD_DDict) -> usize;
+ }
+ extern "C" {
+     #[doc = " ZSTD_decompress_usingDDict() :\n  Decompression using a digested Dictionary.\n  Recommended when same dictionary is used multiple times."]
++    #[link_name = "lzcb_ZSTD_decompress_usingDDict"]
+     pub fn ZSTD_decompress_usingDDict(
+         dctx: *mut ZSTD_DCtx,
+         dst: *mut ::core::ffi::c_void,
+@@ -537,6 +589,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_getDictID_fromDict() : Requires v1.4.0+\n  Provides the dictID stored within dictionary.\n  if @return == 0, the dictionary is not conformant with Zstandard specification.\n  It can still be loaded, but as a content-only dictionary."]
++    #[link_name = "lzcb_ZSTD_getDictID_fromDict"]
+     pub fn ZSTD_getDictID_fromDict(
+         dict: *const ::core::ffi::c_void,
+         dictSize: usize,
+@@ -544,18 +597,21 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_getDictID_fromCDict() : Requires v1.5.0+\n  Provides the dictID of the dictionary loaded into `cdict`.\n  If @return == 0, the dictionary is not conformant to Zstandard specification, or empty.\n  Non-conformant dictionaries can still be loaded, but as content-only dictionaries."]
++    #[link_name = "lzcb_ZSTD_getDictID_fromCDict"]
+     pub fn ZSTD_getDictID_fromCDict(
+         cdict: *const ZSTD_CDict,
+     ) -> ::core::ffi::c_uint;
+ }
+ extern "C" {
+     #[doc = " ZSTD_getDictID_fromDDict() : Requires v1.4.0+\n  Provides the dictID of the dictionary loaded into `ddict`.\n  If @return == 0, the dictionary is not conformant to Zstandard specification, or empty.\n  Non-conformant dictionaries can still be loaded, but as content-only dictionaries."]
++    #[link_name = "lzcb_ZSTD_getDictID_fromDDict"]
+     pub fn ZSTD_getDictID_fromDDict(
+         ddict: *const ZSTD_DDict,
+     ) -> ::core::ffi::c_uint;
+ }
+ extern "C" {
+     #[doc = " ZSTD_getDictID_fromFrame() : Requires v1.4.0+\n  Provides the dictID required to decompressed the frame stored within `src`.\n  If @return == 0, the dictID could not be decoded.\n  This could for one of the following reasons :\n  - The frame does not require a dictionary to be decoded (most common case).\n  - The frame was built with dictID intentionally removed. Whatever dictionary is necessary is a hidden piece of information.\n    Note : this use case also happens when using a non-conformant dictionary.\n  - `srcSize` is too small, and as a result, the frame header could not be decoded (only possible if `srcSize < ZSTD_FRAMEHEADERSIZE_MAX`).\n  - This is not a Zstandard frame.\n  When identifying the exact failure cause, it's possible to use ZSTD_getFrameHeader(), which will provide a more precise error code."]
++    #[link_name = "lzcb_ZSTD_getDictID_fromFrame"]
+     pub fn ZSTD_getDictID_fromFrame(
+         src: *const ::core::ffi::c_void,
+         srcSize: usize,
+@@ -563,6 +619,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_CCtx_loadDictionary() : Requires v1.4.0+\n  Create an internal CDict from `dict` buffer.\n  Decompression will have to use same dictionary.\n @result : 0, or an error code (which can be tested with ZSTD_isError()).\n  Special: Loading a NULL (or 0-size) dictionary invalidates previous dictionary,\n           meaning \"return to no-dictionary mode\".\n  Note 1 : Dictionary is sticky, it will be used for all future compressed frames,\n           until parameters are reset, a new dictionary is loaded, or the dictionary\n           is explicitly invalidated by loading a NULL dictionary.\n  Note 2 : Loading a dictionary involves building tables.\n           It's also a CPU consuming operation, with non-negligible impact on latency.\n           Tables are dependent on compression parameters, and for this reason,\n           compression parameters can no longer be changed after loading a dictionary.\n  Note 3 :`dict` content will be copied internally.\n           Use experimental ZSTD_CCtx_loadDictionary_byReference() to reference content instead.\n           In such a case, dictionary buffer must outlive its users.\n  Note 4 : Use ZSTD_CCtx_loadDictionary_advanced()\n           to precisely select how dictionary content must be interpreted.\n  Note 5 : This method does not benefit from LDM (long distance mode).\n           If you want to employ LDM on some large dictionary content,\n           prefer employing ZSTD_CCtx_refPrefix() described below."]
++    #[link_name = "lzcb_ZSTD_CCtx_loadDictionary"]
+     pub fn ZSTD_CCtx_loadDictionary(
+         cctx: *mut ZSTD_CCtx,
+         dict: *const ::core::ffi::c_void,
+@@ -571,6 +628,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_CCtx_refCDict() : Requires v1.4.0+\n  Reference a prepared dictionary, to be used for all future compressed frames.\n  Note that compression parameters are enforced from within CDict,\n  and supersede any compression parameter previously set within CCtx.\n  The parameters ignored are labelled as \"superseded-by-cdict\" in the ZSTD_cParameter enum docs.\n  The ignored parameters will be used again if the CCtx is returned to no-dictionary mode.\n  The dictionary will remain valid for future compressed frames using same CCtx.\n @result : 0, or an error code (which can be tested with ZSTD_isError()).\n  Special : Referencing a NULL CDict means \"return to no-dictionary mode\".\n  Note 1 : Currently, only one dictionary can be managed.\n           Referencing a new dictionary effectively \"discards\" any previous one.\n  Note 2 : CDict is just referenced, its lifetime must outlive its usage within CCtx."]
++    #[link_name = "lzcb_ZSTD_CCtx_refCDict"]
+     pub fn ZSTD_CCtx_refCDict(
+         cctx: *mut ZSTD_CCtx,
+         cdict: *const ZSTD_CDict,
+@@ -578,6 +636,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_CCtx_refPrefix() : Requires v1.4.0+\n  Reference a prefix (single-usage dictionary) for next compressed frame.\n  A prefix is **only used once**. Tables are discarded at end of frame (ZSTD_e_end).\n  Decompression will need same prefix to properly regenerate data.\n  Compressing with a prefix is similar in outcome as performing a diff and compressing it,\n  but performs much faster, especially during decompression (compression speed is tunable with compression level).\n  This method is compatible with LDM (long distance mode).\n @result : 0, or an error code (which can be tested with ZSTD_isError()).\n  Special: Adding any prefix (including NULL) invalidates any previous prefix or dictionary\n  Note 1 : Prefix buffer is referenced. It **must** outlive compression.\n           Its content must remain unmodified during compression.\n  Note 2 : If the intention is to diff some large src data blob with some prior version of itself,\n           ensure that the window size is large enough to contain the entire source.\n           See ZSTD_c_windowLog.\n  Note 3 : Referencing a prefix involves building tables, which are dependent on compression parameters.\n           It's a CPU consuming operation, with non-negligible impact on latency.\n           If there is a need to use the same prefix multiple times, consider loadDictionary instead.\n  Note 4 : By default, the prefix is interpreted as raw content (ZSTD_dct_rawContent).\n           Use experimental ZSTD_CCtx_refPrefix_advanced() to alter dictionary interpretation."]
++    #[link_name = "lzcb_ZSTD_CCtx_refPrefix"]
+     pub fn ZSTD_CCtx_refPrefix(
+         cctx: *mut ZSTD_CCtx,
+         prefix: *const ::core::ffi::c_void,
+@@ -586,6 +645,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_DCtx_loadDictionary() : Requires v1.4.0+\n  Create an internal DDict from dict buffer, to be used to decompress all future frames.\n  The dictionary remains valid for all future frames, until explicitly invalidated, or\n  a new dictionary is loaded.\n @result : 0, or an error code (which can be tested with ZSTD_isError()).\n  Special : Adding a NULL (or 0-size) dictionary invalidates any previous dictionary,\n            meaning \"return to no-dictionary mode\".\n  Note 1 : Loading a dictionary involves building tables,\n           which has a non-negligible impact on CPU usage and latency.\n           It's recommended to \"load once, use many times\", to amortize the cost\n  Note 2 :`dict` content will be copied internally, so `dict` can be released after loading.\n           Use ZSTD_DCtx_loadDictionary_byReference() to reference dictionary content instead.\n  Note 3 : Use ZSTD_DCtx_loadDictionary_advanced() to take control of\n           how dictionary content is loaded and interpreted."]
++    #[link_name = "lzcb_ZSTD_DCtx_loadDictionary"]
+     pub fn ZSTD_DCtx_loadDictionary(
+         dctx: *mut ZSTD_DCtx,
+         dict: *const ::core::ffi::c_void,
+@@ -594,6 +654,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_DCtx_refDDict() : Requires v1.4.0+\n  Reference a prepared dictionary, to be used to decompress next frames.\n  The dictionary remains active for decompression of future frames using same DCtx.\n\n  If called with ZSTD_d_refMultipleDDicts enabled, repeated calls of this function\n  will store the DDict references in a table, and the DDict used for decompression\n  will be determined at decompression time, as per the dict ID in the frame.\n  The memory for the table is allocated on the first call to refDDict, and can be\n  freed with ZSTD_freeDCtx().\n\n  If called with ZSTD_d_refMultipleDDicts disabled (the default), only one dictionary\n  will be managed, and referencing a dictionary effectively \"discards\" any previous one.\n\n @result : 0, or an error code (which can be tested with ZSTD_isError()).\n  Special: referencing a NULL DDict means \"return to no-dictionary mode\".\n  Note 2 : DDict is just referenced, its lifetime must outlive its usage from DCtx."]
++    #[link_name = "lzcb_ZSTD_DCtx_refDDict"]
+     pub fn ZSTD_DCtx_refDDict(
+         dctx: *mut ZSTD_DCtx,
+         ddict: *const ZSTD_DDict,
+@@ -601,6 +662,7 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_DCtx_refPrefix() : Requires v1.4.0+\n  Reference a prefix (single-usage dictionary) to decompress next frame.\n  This is the reverse operation of ZSTD_CCtx_refPrefix(),\n  and must use the same prefix as the one used during compression.\n  Prefix is **only used once**. Reference is discarded at end of frame.\n  End of frame is reached when ZSTD_decompressStream() returns 0.\n @result : 0, or an error code (which can be tested with ZSTD_isError()).\n  Note 1 : Adding any prefix (including NULL) invalidates any previously set prefix or dictionary\n  Note 2 : Prefix buffer is referenced. It **must** outlive decompression.\n           Prefix buffer must remain unmodified up to the end of frame,\n           reached when ZSTD_decompressStream() returns 0.\n  Note 3 : By default, the prefix is treated as raw content (ZSTD_dct_rawContent).\n           Use ZSTD_CCtx_refPrefix_advanced() to alter dictMode (Experimental section)\n  Note 4 : Referencing a raw content prefix has almost no cpu nor memory cost.\n           A full dictionary is more costly, as it requires building tables."]
++    #[link_name = "lzcb_ZSTD_DCtx_refPrefix"]
+     pub fn ZSTD_DCtx_refPrefix(
+         dctx: *mut ZSTD_DCtx,
+         prefix: *const ::core::ffi::c_void,
+@@ -609,20 +671,26 @@
+ }
+ extern "C" {
+     #[doc = " ZSTD_sizeof_*() : Requires v1.4.0+\n  These functions give the _current_ memory usage of selected object.\n  Note that object memory usage can evolve (increase or decrease) over time."]
++    #[link_name = "lzcb_ZSTD_sizeof_CCtx"]
+     pub fn ZSTD_sizeof_CCtx(cctx: *const ZSTD_CCtx) -> usize;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_sizeof_DCtx"]
+     pub fn ZSTD_sizeof_DCtx(dctx: *const ZSTD_DCtx) -> usize;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_sizeof_CStream"]
+     pub fn ZSTD_sizeof_CStream(zcs: *const ZSTD_CStream) -> usize;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_sizeof_DStream"]
+     pub fn ZSTD_sizeof_DStream(zds: *const ZSTD_DStream) -> usize;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_sizeof_CDict"]
+     pub fn ZSTD_sizeof_CDict(cdict: *const ZSTD_CDict) -> usize;
+ }
+ extern "C" {
++    #[link_name = "lzcb_ZSTD_sizeof_DDict"]
+     pub fn ZSTD_sizeof_DDict(ddict: *const ZSTD_DDict) -> usize;
+ }
+--- a/src/lib.rs	2026-09-22 02:36:39.636983854 +0300
++++ b/src/lib.rs	2026-09-22 02:36:39.641764681 +0300
+@@ -2,7 +2,11 @@
+ #![allow(non_camel_case_types)]
+ #![allow(non_snake_case)]
+ #![no_std]
+-//! Low-level bindings to the [zstd] library.
++//! Low-level bindings to the [zstd] library, forked for `lz-copyback`.
++//!
++//! This fork exposes the decoder's LZ match hook (`ZSTD_DCtx_setLzMatchHook`,
++//! `ZSTD_DCtx_getLzTotalOut`) and prefixes every C symbol with `lzcb_`, so it can be
++//! linked into a binary that also links the genuine `zstd-sys`. See `PATCH.md`.
+ //!
+ //! [zstd]: https://facebook.github.io/zstd/
+ 
+@@ -12,30 +16,4 @@
+ #[cfg(target_arch = "wasm32")]
+ mod wasm_shim;
+ 
+-// If running bindgen, we'll end up with the correct bindings anyway.
+-#[cfg(feature = "bindgen")]
+-include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+-
+-// The bindings used depend on a few feature flags.
+-#[cfg(all(not(feature = "experimental"), not(feature = "bindgen")))]
+ include!("bindings_zstd.rs");
+-
+-#[cfg(all(
+-    not(feature = "experimental"),
+-    feature = "zdict_builder",
+-    not(feature = "bindgen")
+-))]
+-include!("bindings_zdict.rs");
+-
+-#[cfg(all(feature = "experimental", not(feature = "bindgen")))]
+-include!("bindings_zstd_experimental.rs");
+-
+-#[cfg(all(
+-    feature = "experimental",
+-    feature = "zdict_builder",
+-    not(feature = "bindgen")
+-))]
+-include!("bindings_zdict_experimental.rs");
+-
+-#[cfg(all(feature = "seekable", not(feature = "bindgen")))]
+-include!("bindings_zstd_seekable.rs");
+--- a/src/wasm_shim.rs	2026-09-22 02:36:39.636998973 +0300
++++ b/src/wasm_shim.rs	2026-09-22 02:36:39.641716390 +0300
+@@ -5,7 +5,7 @@
+ const USIZE_SIZE: usize = core::mem::size_of::<usize>();
+ 
+ #[no_mangle]
+-pub extern "C" fn rust_zstd_wasm_shim_qsort(
++pub extern "C" fn rust_lzcb_zstd_wasm_shim_qsort(
+     base: *mut c_void,
+     n_items: usize,
+     size: usize,
+@@ -41,12 +41,12 @@
+ }
+ 
+ #[no_mangle]
+-pub extern "C" fn rust_zstd_wasm_shim_malloc(size: usize) -> *mut c_void {
++pub extern "C" fn rust_lzcb_zstd_wasm_shim_malloc(size: usize) -> *mut c_void {
+     wasm_shim_alloc::<false>(size)
+ }
+ 
+ #[no_mangle]
+-pub extern "C" fn rust_zstd_wasm_shim_memcmp(
++pub extern "C" fn rust_lzcb_zstd_wasm_shim_memcmp(
+     str1: *const c_void,
+     str2: *const c_void,
+     n: usize,
+@@ -64,7 +64,7 @@
+ }
+ 
+ #[no_mangle]
+-pub extern "C" fn rust_zstd_wasm_shim_calloc(
++pub extern "C" fn rust_lzcb_zstd_wasm_shim_calloc(
+     nmemb: usize,
+     size: usize,
+ ) -> *mut c_void {
+@@ -99,7 +99,7 @@
+ }
+ 
+ #[no_mangle]
+-pub unsafe extern "C" fn rust_zstd_wasm_shim_free(ptr: *mut c_void) {
++pub unsafe extern "C" fn rust_lzcb_zstd_wasm_shim_free(ptr: *mut c_void) {
+     // the layout for the allocation needs to be recovered for dealloc
+     // - the size must be recovered from directly below the allocation
+     // - the alignment will always by USIZE_ALIGN
+@@ -114,7 +114,7 @@
+ }
+ 
+ #[no_mangle]
+-pub unsafe extern "C" fn rust_zstd_wasm_shim_memcpy(
++pub unsafe extern "C" fn rust_lzcb_zstd_wasm_shim_memcpy(
+     dest: *mut c_void,
+     src: *const c_void,
+     n: usize,
+@@ -124,7 +124,7 @@
+ }
+ 
+ #[no_mangle]
+-pub unsafe extern "C" fn rust_zstd_wasm_shim_memmove(
++pub unsafe extern "C" fn rust_lzcb_zstd_wasm_shim_memmove(
+     dest: *mut c_void,
+     src: *const c_void,
+     n: usize,
+@@ -134,7 +134,7 @@
+ }
+ 
+ #[no_mangle]
+-pub unsafe extern "C" fn rust_zstd_wasm_shim_memset(
++pub unsafe extern "C" fn rust_lzcb_zstd_wasm_shim_memset(
+     dest: *mut c_void,
+     c: c_int,
+     n: usize,
+--- a/wasm-shim/stdlib.h	2026-09-22 02:36:39.637059327 +0300
++++ b/wasm-shim/stdlib.h	2026-09-22 02:36:39.641833983 +0300
+@@ -3,16 +3,16 @@
+ #ifndef _STDLIB_H
+ #define _STDLIB_H 1
+ 
+-void* rust_zstd_wasm_shim_malloc(size_t size);
+-void* rust_zstd_wasm_shim_calloc(size_t nmemb, size_t size);
+-void rust_zstd_wasm_shim_free(void* ptr);
+-void rust_zstd_wasm_shim_qsort(void* base, size_t nitems, size_t size,
++void* rust_lzcb_zstd_wasm_shim_malloc(size_t size);
++void* rust_lzcb_zstd_wasm_shim_calloc(size_t nmemb, size_t size);
++void rust_lzcb_zstd_wasm_shim_free(void* ptr);
++void rust_lzcb_zstd_wasm_shim_qsort(void* base, size_t nitems, size_t size,
+                                int (*compar)(const void*, const void*));
+ 
+-#define malloc(size) rust_zstd_wasm_shim_malloc(size)
+-#define calloc(nmemb, size) rust_zstd_wasm_shim_calloc(nmemb, size)
+-#define free(ptr) rust_zstd_wasm_shim_free(ptr)
++#define malloc(size) rust_lzcb_zstd_wasm_shim_malloc(size)
++#define calloc(nmemb, size) rust_lzcb_zstd_wasm_shim_calloc(nmemb, size)
++#define free(ptr) rust_lzcb_zstd_wasm_shim_free(ptr)
+ #define qsort(base, nitems, size, compar) \
+-  rust_zstd_wasm_shim_qsort(base, nitems, size, compar)
++  rust_lzcb_zstd_wasm_shim_qsort(base, nitems, size, compar)
+ 
+ #endif  // _STDLIB_H
+--- a/wasm-shim/string.h	2026-09-22 02:36:39.637072592 +0300
++++ b/wasm-shim/string.h	2026-09-22 02:36:39.641845124 +0300
+@@ -3,25 +3,25 @@
+ #ifndef	_STRING_H
+ #define	_STRING_H	1
+ 
+-int rust_zstd_wasm_shim_memcmp(const void *str1, const void *str2, size_t n);
+-void *rust_zstd_wasm_shim_memcpy(void *restrict dest, const void *restrict src, size_t n);
+-void *rust_zstd_wasm_shim_memmove(void *dest, const void *src, size_t n);
+-void *rust_zstd_wasm_shim_memset(void *dest, int c, size_t n);
++int rust_lzcb_zstd_wasm_shim_memcmp(const void *str1, const void *str2, size_t n);
++void *rust_lzcb_zstd_wasm_shim_memcpy(void *restrict dest, const void *restrict src, size_t n);
++void *rust_lzcb_zstd_wasm_shim_memmove(void *dest, const void *src, size_t n);
++void *rust_lzcb_zstd_wasm_shim_memset(void *dest, int c, size_t n);
+ 
+ inline int memcmp(const void *str1, const void *str2, size_t n) {
+-    return rust_zstd_wasm_shim_memcmp(str1, str2, n);
++    return rust_lzcb_zstd_wasm_shim_memcmp(str1, str2, n);
+ }
+ 
+ inline void *memcpy(void *restrict dest, const void *restrict src, size_t n) {
+-	return rust_zstd_wasm_shim_memcpy(dest, src, n);
++	return rust_lzcb_zstd_wasm_shim_memcpy(dest, src, n);
+ }
+ 
+ inline void *memmove(void *dest, const void *src, size_t n) {
+-	return rust_zstd_wasm_shim_memmove(dest, src, n);
++	return rust_lzcb_zstd_wasm_shim_memmove(dest, src, n);
+ }
+ 
+ inline void *memset(void *dest, int c, size_t n) {
+-	return rust_zstd_wasm_shim_memset(dest, c, n);
++	return rust_lzcb_zstd_wasm_shim_memset(dest, c, n);
+ }
+ 
+ #endif // _STRING_H
+--- a/zstd/lib/common/zstd_common.c	2026-09-22 02:36:39.637800311 +0300
++++ b/zstd/lib/common/zstd_common.c	2026-09-22 02:36:39.642323961 +0300
+@@ -30,6 +30,11 @@
+ *  ZSTD Error Management
+ ******************************************/
+ #undef ZSTD_isError   /* defined within zstd_internal.h */
++/* lzcb: zstd_internal.h redefined ZSTD_isError to ERR_isError, clobbering our prefix
++ * macro, and the #undef above removed it entirely -- so this definition would export an
++ * unprefixed ZSTD_isError while the Rust bindings ask for lzcb_ZSTD_isError. The prefix
++ * header is #ifndef-guarded, so re-including it restores exactly this one entry. */
++#include "lzcb_prefix.h"
+ /*! ZSTD_isError() :
+  *  tells if a return value is an error code
+  *  symbol is required for external callers */
+--- a/zstd/lib/common/zstd_internal.h	2026-09-22 02:36:39.637833865 +0300
++++ b/zstd/lib/common/zstd_internal.h	2026-09-22 02:36:39.642347946 +0300
+@@ -41,6 +41,14 @@
+ 
+ /* ---- static assert (debug) --- */
+ #define ZSTD_STATIC_ASSERT(c) DEBUG_STATIC_ASSERT(c)
++/* lzcb: these shadow the exported functions so calls inline to ERR_isError. The names
++ * already carry an lzcb_ prefix macro from the force-included lzcb_prefix.h, so redefine
++ * them only after dropping it -- otherwise every translation unit warns. The exported
++ * definitions live in TUs that do not include this header (entropy_common.c) or that undo
++ * the shadowing explicitly (zstd_common.c), so they still get the prefix. */
++#undef ZSTD_isError
++#undef FSE_isError
++#undef HUF_isError
+ #define ZSTD_isError ERR_isError   /* for inlining */
+ #define FSE_isError  ERR_isError
+ #define HUF_isError  ERR_isError
+--- a/zstd/lib/decompress/zstd_decompress_block.c	2026-09-22 02:36:39.639262281 +0300
++++ b/zstd/lib/decompress/zstd_decompress_block.c	2026-09-22 02:36:39.643236089 +0300
+@@ -1508,6 +1508,7 @@
+ #endif
+                     if (UNLIKELY(ZSTD_isError(oneSeqSize)))
+                         return oneSeqSize;
++                    ZSTD_LZ_HOOK(dctx, ostart, op, sequence);
+                     DEBUGLOG(6, "regenerated sequence size : %u", (U32)oneSeqSize);
+                     op += oneSeqSize;
+             }   }
+@@ -1533,6 +1534,7 @@
+ #endif
+                     if (UNLIKELY(ZSTD_isError(oneSeqSize)))
+                         return oneSeqSize;
++                    ZSTD_LZ_HOOK(dctx, ostart, op, sequence);
+                     DEBUGLOG(6, "regenerated sequence size : %u", (U32)oneSeqSize);
+                     op += oneSeqSize;
+                 }
+@@ -1569,6 +1571,7 @@
+ #endif
+                 if (UNLIKELY(ZSTD_isError(oneSeqSize)))
+                     return oneSeqSize;
++                ZSTD_LZ_HOOK(dctx, ostart, op, sequence);
+                 DEBUGLOG(6, "regenerated sequence size : %u", (U32)oneSeqSize);
+                 op += oneSeqSize;
+             }
+@@ -1665,6 +1668,7 @@
+ #endif
+             if (UNLIKELY(ZSTD_isError(oneSeqSize)))
+                 return oneSeqSize;
++            ZSTD_LZ_HOOK(dctx, ostart, op, sequence);
+             DEBUGLOG(6, "regenerated sequence size : %u", (U32)oneSeqSize);
+             op += oneSeqSize;
+         }
+@@ -1799,6 +1803,7 @@
+                     ZSTD_assertValidSequence(dctx, op, oend, sequences[(seqNb - ADVANCED_SEQS) & STORED_SEQS_MASK], prefixStart, dictStart);
+ #endif
+                     if (ZSTD_isError(oneSeqSize)) return oneSeqSize;
++                    ZSTD_LZ_HOOK(dctx, ostart, op, sequences[(seqNb - ADVANCED_SEQS) & STORED_SEQS_MASK]);
+ 
+                     prefetchPos = ZSTD_prefetchMatch(prefetchPos, sequence, prefixStart, dictEnd);
+                     sequences[seqNb & STORED_SEQS_MASK] = sequence;
+@@ -1815,6 +1820,7 @@
+                 ZSTD_assertValidSequence(dctx, op, oend, sequences[(seqNb - ADVANCED_SEQS) & STORED_SEQS_MASK], prefixStart, dictStart);
+ #endif
+                 if (ZSTD_isError(oneSeqSize)) return oneSeqSize;
++                ZSTD_LZ_HOOK(dctx, ostart, op, sequences[(seqNb - ADVANCED_SEQS) & STORED_SEQS_MASK]);
+ 
+                 prefetchPos = ZSTD_prefetchMatch(prefetchPos, sequence, prefixStart, dictEnd);
+                 sequences[seqNb & STORED_SEQS_MASK] = sequence;
+@@ -1844,6 +1850,7 @@
+                     ZSTD_assertValidSequence(dctx, op, oend, sequences[seqNb&STORED_SEQS_MASK], prefixStart, dictStart);
+ #endif
+                     if (ZSTD_isError(oneSeqSize)) return oneSeqSize;
++                    ZSTD_LZ_HOOK(dctx, ostart, op, *sequence);
+                     op += oneSeqSize;
+                 }
+             }
+@@ -1857,6 +1864,7 @@
+                 ZSTD_assertValidSequence(dctx, op, oend, sequences[seqNb&STORED_SEQS_MASK], prefixStart, dictStart);
+ #endif
+                 if (ZSTD_isError(oneSeqSize)) return oneSeqSize;
++                ZSTD_LZ_HOOK(dctx, ostart, op, *sequence);
+                 op += oneSeqSize;
+             }
+         }
+--- a/zstd/lib/decompress/zstd_decompress.c	2026-09-22 02:36:39.639193240 +0300
++++ b/zstd/lib/decompress/zstd_decompress.c	2026-09-22 02:36:39.643186715 +0300
+@@ -251,6 +251,9 @@
+ 
+ static void ZSTD_initDCtx_internal(ZSTD_DCtx* dctx)
+ {
++    dctx->lzTotalOut = 0;
++    dctx->lzHook = NULL;
++    dctx->lzHookCtx = NULL;
+     dctx->staticSize  = 0;
+     dctx->ddict       = NULL;
+     dctx->ddictLocal  = NULL;
+@@ -1029,6 +1032,7 @@
+             RETURN_ERROR(corruption_detected, "invalid block type");
+         }
+         FORWARD_IF_ERROR(decodedSize, "Block decompression failure");
++        dctx->lzTotalOut += decodedSize;
+         DEBUGLOG(5, "Decompressed block of dSize = %u", (unsigned)decodedSize);
+         if (dctx->validateChecksum) {
+             XXH64_update(&dctx->xxhState, op, decodedSize);
+@@ -1367,6 +1371,7 @@
+             RETURN_ERROR_IF(rSize > dctx->fParams.blockSizeMax, corruption_detected, "Decompressed Block Size Exceeds Maximum");
+             DEBUGLOG(5, "ZSTD_decompressContinue: decoded size from block : %u", (unsigned)rSize);
+             dctx->decodedSize += rSize;
++            dctx->lzTotalOut += rSize;
+             if (dctx->validateChecksum) XXH64_update(&dctx->xxhState, dst, rSize);
+             dctx->previousDstEnd = (char*)dst + rSize;
+ 
+@@ -2408,3 +2413,18 @@
+         return cErr;
+     }
+ }
++
++
++/* ggcat LZ hook API (see zstd_decompress_internal.h) */
++void ZSTD_DCtx_setLzMatchHook(ZSTD_DCtx* dctx,
++        void (*hook)(void* ctx, unsigned long long dstAbs, unsigned distance, unsigned matchLength),
++        void* ctx)
++{
++    dctx->lzHook = hook;
++    dctx->lzHookCtx = ctx;
++}
++
++unsigned long long ZSTD_DCtx_getLzTotalOut(const ZSTD_DCtx* dctx)
++{
++    return dctx->lzTotalOut;
++}
+--- a/zstd/lib/decompress/zstd_decompress_internal.h	2026-09-22 02:36:39.639323326 +0300
++++ b/zstd/lib/decompress/zstd_decompress_internal.h	2026-09-22 02:36:39.643283499 +0300
+@@ -139,6 +139,11 @@
+     ZSTD_FrameHeader fParams;
+     U64 processedCSize;
+     U64 decodedSize;
++    /* ggcat LZ hook: decoded bytes across all frames (never reset) and the
++     * match callback installed with ZSTD_DCtx_setLzMatchHook(). */
++    U64 lzTotalOut;
++    void (*lzHook)(void* ctx, unsigned long long dstAbs, unsigned distance, unsigned matchLength);
++    void* lzHookCtx;
+     blockType_e bType;            /* used in ZSTD_decompressContinue(), store blockType between block header decoding and block decompression stages */
+     ZSTD_dStage stage;
+     U32 litEntropy;
+@@ -237,4 +242,20 @@
+ void ZSTD_checkContinuity(ZSTD_DCtx* dctx, const void* dst, size_t dstSize);
+ 
+ 
++
++/* ggcat LZ hook: report one sequence right before it is executed. `op` is the
++ * block output cursor, `ostart` the block start; the match destination is
++ * lzTotalOut + (op - ostart) + litLength and `offset` is the resolved distance. */
++#define ZSTD_LZ_HOOK(dctx, ostart, op, seq) do { \
++    if ((dctx)->lzHook != NULL) \
++        (dctx)->lzHook((dctx)->lzHookCtx, \
++            (unsigned long long)(dctx)->lzTotalOut + (unsigned long long)((op) - (ostart)) + (unsigned long long)(seq).litLength, \
++            (unsigned)(seq).offset, (unsigned)(seq).matchLength); \
++} while (0)
++
++ZSTDLIB_API void ZSTD_DCtx_setLzMatchHook(ZSTD_DCtx* dctx,
++        void (*hook)(void* ctx, unsigned long long dstAbs, unsigned distance, unsigned matchLength),
++        void* ctx);
++ZSTDLIB_API unsigned long long ZSTD_DCtx_getLzTotalOut(const ZSTD_DCtx* dctx);
++
+ #endif /* ZSTD_DECOMPRESS_INTERNAL_H */

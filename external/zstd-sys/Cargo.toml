@@ -1,0 +1,71 @@
+# Vendored copy of zstd-sys 2.0.16+zstd.1.5.7 with the ggcat LZ match hook (see PATCH.md).
+
+[package]
+edition = "2018"
+rust-version = "1.64"
+name = "lzcb-zstd-sys"
+version = "0.1.0+zstd.1.5.7"
+authors = ["Alexandre Bury <alexandre.bury@gmail.com>"]
+build = "build.rs"
+links = "lzcb_zstd"
+include = [
+    "/LICENSE*",
+    "!/*.sh",
+    "/build.rs",
+    "/*.h",
+    "/lzcb_prefix.h",
+    "/PATCH.md",
+    "/ggcat-lz-hook.patch",
+    "/src/",
+    "/wasm-shim/**/*.h",
+    "/zstd/LICENSE",
+    "/zstd/COPYING",
+    "/zstd/lib/**/*.c",
+    "/zstd/lib/**/*.h",
+    "/zstd/lib/**/*.S",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Fork of zstd-sys 2.0.16 (zstd 1.5.7) whose decoder reports every LZ match through a hook and whose C symbols are prefixed, for the lz-copyback crate."
+readme = "Readme.md"
+keywords = [
+    "zstd",
+    "zstandard",
+    "compression",
+]
+categories = [
+    "api-bindings",
+    "compression",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/algbio/ggcat"
+# upstream: "https://github.com/gyscos/zstd-rs"
+
+[features]
+default = []
+fat-lto = []
+no_asm = []
+no_wasm_shim = []
+std = []
+thin-lto = []
+
+[lib]
+name = "lzcb_zstd_sys"
+path = "src/lib.rs"
+doctest = false
+
+[build-dependencies.cc]
+version = "1.0.45"
+features = ["parallel"]
+
+[lints.rust]
+non_upper_case_globals = "allow"
+[[test]]
+name = "symbols"
+path = "tests/symbols.rs"
+
+[dev-dependencies.object]
+version = "0.37"
