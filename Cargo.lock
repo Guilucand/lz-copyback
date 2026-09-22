@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "lz-copyback"
-version = "2.2.0"
+version = "1.0.0"
 dependencies = [
  "bzip2",
  "crc32fast",
