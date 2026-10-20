@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "lz-copyback"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "crc32fast",
  "flate2",

@@ -1,6 +1,6 @@
 [package]
 name = "lz-copyback"
-version = "3.0.0"
+version = "3.0.1"
 authors = ["Andrea Cracco <guilucand@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
