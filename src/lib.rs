@@ -1,39 +1,61 @@
-//! Streaming decompression that reports the LZ77 copies the decoder executes.
+//! Patched copies of the LZ decoders ggcat reads its inputs with, each reporting the LZ
+//! matches ("copybacks") it decodes.
 //!
-//! Every LZ-based format (deflate, LZMA2, zstd, lz4) produces most of its output by
-//! copying bytes that appeared earlier in the stream. A [`TrackingDecoder`] wraps a
-//! format-specific [`LzBackend`], keeps a window of twice the maximum copy distance and
-//! hands the output out one half-window at a time together with its copies. Under
-//! [`Direction::Forward`] those are the copies whose source lies in that half: byte
-//! ranges that will appear again, verbatim, later in the stream. Under
-//! [`Direction::Backward`] they are the copies whose destination lies in it: ranges that
-//! repeat bytes from anywhere earlier in the stream. Copies are merged when the
-//! compressor split them, clipped so they never overlap their own source, and filtered by
-//! a minimum length.
+//! | codec | fork | decoder |
+//! |---|---|---|
+//! | xz | `lzcb-liblzma` (liblzma 0.4.9) | `lzcb_liblzma::read::XzDecoder` |
+//! | zstd | `lzcb-zstd` (zstd 0.13.3) | `lzcb_zstd::stream::read::Decoder` |
+//! | lz4 | `lzcb-lz4` (lz4 1.28.1) | `lzcb_lz4::Decoder` |
+//! | gzip | `streaming-libdeflate-rs` | `LibdeflateGzipFileDecompressor`, `LibdeflateGzipPushDecompressor` |
 //!
-//! The [`tar`] module maps those copies onto the members of a tar archive, so a copy from
-//! one file to another inside a `.tar.xz` is attributed to both members.
+//! Every one of those decoders has the same three extra methods:
 //!
-//! Formats without an LZ stage (bzip2, plain files) go through a passthrough backend that
-//! reports no copies, so consumers have a single code path.
+//! * `set_copybacks_tracking(bool)`: on at construction; while off, matches are ignored.
+//! * `set_copybacks_min_len(u32)`: matches shorter than this are ignored; 1 at construction.
+//! * `peek_copybacks() -> &mut VecDeque<(u64, u32, u32)>`: every match recorded so far, in
+//!   stream order. The decoder only ever pushes to the back; removing entries is up to
+//!   the caller.
+//!
+//! A match is pushed during the call that hands out its first destination byte, or
+//! earlier: zstd and lz4 decode a whole block into a buffer of their own before handing
+//! it out, so their matches can arrive up to one block ahead of the bytes.
+//!
+//! The forks push plain tuples so they need no common dependency; this crate only names
+//! the tuple and its fields.
 
-pub mod backend;
-pub mod backends;
-pub mod config;
-pub mod copy;
-pub mod decoder;
-pub mod error;
-pub mod open;
-pub mod recorder;
-mod sort;
-pub mod stats;
-pub mod tar;
+/// One LZ match exactly as the decoder decoded it, never merged, clipped or split:
+/// `(destination, offset, len)`. See [`CopybackExt`] for the fields.
+pub type Copyback = (u64, u32, u32);
 
-pub use backend::{BackendError, LzBackend, SLACK};
-pub use config::{Direction, SelfOverlap, TrackerConfig};
-pub use copy::LzCopy;
-pub use decoder::{TrackingDecoder, Window};
-pub use error::Error;
-pub use open::{Codec, codec_of, is_archive, open, open_reader};
-pub use recorder::CopyRecorder;
-pub use stats::{Stat, TrackerStats};
+/// The fields of a [`Copyback`] by name.
+#[allow(clippy::len_without_is_empty)]
+pub trait CopybackExt {
+    /// Absolute offset of the first byte the match writes, counted from the first byte the
+    /// decoder produced (across concatenated streams, frames and members).
+    fn destination(&self) -> u64;
+
+    /// How far back the source starts: the match copies the bytes from
+    /// `destination - offset` on. Smaller than [`Self::len`] for a match that overlaps its
+    /// own output (a periodic repeat).
+    fn offset(&self) -> u32;
+
+    /// Number of bytes the match writes.
+    fn len(&self) -> u32;
+}
+
+impl CopybackExt for Copyback {
+    #[inline(always)]
+    fn destination(&self) -> u64 {
+        self.0
+    }
+
+    #[inline(always)]
+    fn offset(&self) -> u32 {
+        self.1
+    }
+
+    #[inline(always)]
+    fn len(&self) -> u32 {
+        self.2
+    }
+}
