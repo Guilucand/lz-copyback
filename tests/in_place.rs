@@ -5,7 +5,9 @@
 
 mod common;
 
-use common::{Codec, check_copybacks, decoder, fasta, gzip_encode, lz4_encode, random_bytes, xz_encode, xz_encode_bcj, zstd_encode};
+use common::{
+    Codec, check_copybacks, decoder, fasta, gzip_encode, lz4_encode, plant, random_bytes, xz_encode, xz_encode_bcj, zstd_encode,
+};
 use lz_copyback::lz4::Lz4InPlaceDecoder;
 use lz_copyback::xz::XzInPlaceDecoder;
 use lz_copyback::zstd::ZstdInPlaceDecoder;
@@ -202,6 +204,19 @@ fn zstd_frames() {
     encoded.extend(b"skip!");
     encoded.extend(zstd_encode(&data(24, 1 << 20), 20));
     check_zstd(&encoded);
+}
+
+#[test]
+fn zstd_frame_of_known_size_keeps_its_start_to_its_end() {
+    // zstd's least buffer for a frame that declares its size is just that size, a buffer that
+    // never wraps; the ring wraps when less than a block of room is left, so its last block,
+    // copying the frame's start, must not be written over that start.
+    let mut data = random_bytes(27, 600_000);
+    plant(&mut data, 0, 560_000, 40_000);
+    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    encoder.set_pledged_src_size(Some(data.len() as u64)).unwrap();
+    encoder.write_all(&data).unwrap();
+    check_with(Codec::Zstd, &encoder.finish().unwrap(), &[(4096, 0), (1, 1000)]);
 }
 
 #[test]

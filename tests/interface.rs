@@ -90,3 +90,44 @@ fn zstd_refuses_windows_over_128_mib_as_zstd_does() {
     let mut decoder = decoder(Codec::Zstd, &encoded, 1 << 20);
     assert!(decoder.decode_to(u64::MAX).is_err());
 }
+
+/// A frame whose content falls short of the size its header declares is an error, also when it
+/// ends with an empty last block, where zstd's buffer-less API does not check it (found by
+/// fuzzing). zstd's own streaming decoder catches it only when the frame fits the caller's
+/// buffer, and so takes its one-shot path, as the zstd command does.
+#[test]
+fn zstd_frame_shorter_than_its_content_size_is_an_error() {
+    // A single-segment frame declaring 128 bytes, then an empty raw block, the last.
+    let encoded = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x80, 0x01, 0x00, 0x00];
+    let mut stock = zstd::stream::read::Decoder::new(&encoded[..]).unwrap();
+    assert!(stock.read(&mut vec![0; 1 << 16]).is_err());
+    let mut decoder = decoder(Codec::Zstd, &encoded, 1 << 20);
+    assert!(decoder.decode_to(u64::MAX).is_err());
+}
+
+/// A `decode_to` that fails on a truncated input leaves readable the bytes it decoded before
+/// the error, as a stock reader hands them out before it fails (found by fuzzing, for gzip).
+fn check_bytes_before_the_error(codec: Codec, encoded: &[u8], data: &[u8]) {
+    let cut = &encoded[..encoded.len() * 3 / 4];
+    let mut decoder = decoder(codec, cut, 1 << 20);
+    assert!(decoder.decode_to(u64::MAX).is_err(), "{codec:?}: a truncated input decoded");
+    let decoded = decoder.decoded_len();
+    assert!(decoded > 0, "{codec:?}: nothing readable before the error");
+    let bytes: Vec<u8> = decoder.bytes(0..decoded).flatten().copied().collect();
+    assert!(bytes == data[..decoded as usize], "{codec:?}: the bytes before the error differ");
+}
+
+#[test]
+fn the_bytes_decoded_before_an_error_are_readable() {
+    let data = data();
+    check_bytes_before_the_error(Codec::Xz, &common::xz_encode(&data, 1 << 20), &data);
+    check_bytes_before_the_error(Codec::Zstd, &common::zstd_encode(&data, 20), &data);
+    check_bytes_before_the_error(Codec::Lz4, &common::lz4_encode(&data, true, ::lz4::BlockSize::Max64KB), &data);
+}
+
+#[test]
+#[ignore = "streaming-libdeflate-rs 0.3.0 decodes the last instruction from the zero padding after a truncated input, and fails only after writing it"]
+fn gzip_bytes_decoded_before_an_error_are_readable() {
+    let data = data();
+    check_bytes_before_the_error(Codec::Gzip, &common::gzip_encode(&data, 6), &data);
+}

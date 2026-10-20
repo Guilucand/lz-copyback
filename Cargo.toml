@@ -39,6 +39,10 @@ lz4 = "1.28.1"
 name = "decode"
 harness = false
 
+[[bench]]
+name = "stress"
+harness = false
+
 [workspace]
 members = [".", "external/lzma-sys", "external/zstd-sys", "external/lz4-sys"]
 

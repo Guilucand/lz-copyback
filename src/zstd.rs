@@ -62,6 +62,10 @@ pub struct ZstdInPlaceDecoder<R> {
     header: Vec<u8>,
     /// The largest block of the frame being decoded, 0 between frames.
     block_max: usize,
+    /// The content size the frame's header declares, if it does, and the bytes of the frame
+    /// decoded so far.
+    content_size: Option<u64>,
+    frame_decoded: u64,
     in_frame: bool,
     /// Whether the last frame was decoded to its end: the input can end only then.
     finished_frame: bool,
@@ -101,6 +105,8 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
             input: Vec::new(),
             header: Vec::new(),
             block_max: 0,
+            content_size: None,
+            frame_decoded: 0,
             in_frame: false,
             finished_frame: false,
             finished: false,
@@ -141,15 +147,18 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
             self.block_max = 0;
             return Ok(());
         }
+        self.content_size = Some(frame.frameContentSize).filter(|&size| size != ffi::ZSTD_CONTENTSIZE_UNKNOWN as u64);
         if frame.windowSize > IN_PLACE_MAX_WINDOW {
             return Err(io::Error::other("Frame requires too much memory for decoding"));
         }
         self.block_max = frame.blockSizeMax as usize;
-        let minimum = unsafe { ffi::ZSTD_decodingBufferSize_min(frame.windowSize, frame.frameContentSize) };
-        check(minimum)?;
-        // The retained bytes, a block decoded past them, and a block of room to decode the
-        // next one, besides what is wasted at the end of the ring when it wraps.
-        let needed = minimum.max(self.retain + 3 * (self.block_max + BLOCK_SLACK));
+        // The window (the whole frame, if it declares its size) and a block of room to decode
+        // the next one, or the retained bytes, a block decoded past them and that room; besides
+        // what is wasted at the end of the ring when it wraps, less than a block. zstd's own
+        // least size (ZSTD_decodingBufferSize_min) is the frame's size when that is smaller,
+        // for a buffer that never wraps within the frame, which this ring does.
+        let room = self.block_max + BLOCK_SLACK;
+        let needed = (frame.windowSize as usize + room).max(self.retain + 2 * room) + room;
         if needed > self.ring_len {
             if self.ring_len > 0 {
                 self.retired.push((self.ring, self.ring_len));
@@ -189,10 +198,17 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
             self.finished_frame = false;
             self.header.clear();
             self.block_max = 0;
+            self.content_size = None;
+            self.frame_decoded = 0;
         }
 
         let size = unsafe { ffi::ZSTD_nextSrcSizeToDecompress(dctx) };
         if size == 0 {
+            // ZSTD_decompressContinue checks the size the header declares only after a block
+            // with bytes in it: a frame ending with an empty last block is checked here.
+            if self.content_size.is_some_and(|size| size != self.frame_decoded) {
+                return Err(io::Error::other("Data corruption detected"));
+            }
             self.in_frame = false;
             self.finished_frame = true;
             return Ok(true);
@@ -244,6 +260,7 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
         }
         let decoded = check(decoded)?;
         self.map.push(self.ring, self.write, decoded);
+        self.frame_decoded += decoded as u64;
         self.write += decoded;
 
         // The header is complete once zstd moves on: the ring can be sized for the frame.

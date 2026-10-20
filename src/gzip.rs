@@ -313,6 +313,23 @@ impl<R: Read> GzipInPlaceDecoder<R> {
         }
     }
 
+    /// Decodes until `target` bytes are decoded or the stream ends.
+    fn decode_while_below(&mut self, target: u64) -> io::Result<()> {
+        while !self.finished && self.ring.decoded() < target {
+            self.ring.blocked = false;
+            match self.step()? {
+                LibdeflateDecompressResult::MoreData => {
+                    if self.ring.blocked {
+                        return Err(ring_too_small("gzip"));
+                    }
+                }
+                LibdeflateDecompressResult::NeedInput => self.read_input()?,
+                LibdeflateDecompressResult::EndOfStream => self.finished = true,
+            }
+        }
+        Ok(())
+    }
+
     /// Reads more compressed bytes, or marks the end of the input.
     fn read_input(&mut self) -> io::Result<()> {
         let space = self.input.input_space_mut();
@@ -340,19 +357,10 @@ impl<R: Read> GzipInPlaceDecoder<R> {
 impl<R: Read> InPlaceDecoder for GzipInPlaceDecoder<R> {
     fn decode_to(&mut self, target: u64) -> io::Result<u64> {
         self.ring.set_bounds(target, protected(target, self.retain));
-        while !self.finished && self.ring.decoded() < target {
-            self.ring.blocked = false;
-            match self.step()? {
-                LibdeflateDecompressResult::MoreData => {
-                    if self.ring.blocked {
-                        return Err(ring_too_small("gzip"));
-                    }
-                }
-                LibdeflateDecompressResult::NeedInput => self.read_input()?,
-                LibdeflateDecompressResult::EndOfStream => self.finished = true,
-            }
-        }
+        let result = self.decode_while_below(target);
+        // The bytes decoded before an error are readable too.
         self.ring.record();
+        result?;
         Ok(self.ring.map.end())
     }
 

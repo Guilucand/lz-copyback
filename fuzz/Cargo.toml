@@ -1,0 +1,83 @@
+[package]
+name = "lz-copyback-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "libFuzzer targets for lz-copyback: raw input against the stock decoders, and round trips"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lz-copyback = { path = ".." }
+# The stock decoders the raw inputs are compared against, and the encoders of the round trips.
+liblzma = { version = "0.4.9", features = ["static", "parallel"] }
+# Without legacy (v0.x) frames, which the zstd fork does not decode either.
+zstd = { version = "0.13.3", default-features = false }
+lz4 = "1.28.1"
+flate2 = "1.1"
+streaming-libdeflate-rs = "0.3.0"
+
+# Not part of lz-copyback's workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "raw_xz"
+path = "fuzz_targets/raw_xz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "raw_zstd"
+path = "fuzz_targets/raw_zstd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "raw_lz4"
+path = "fuzz_targets/raw_lz4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "raw_gzip"
+path = "fuzz_targets/raw_gzip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_xz"
+path = "fuzz_targets/roundtrip_xz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_zstd"
+path = "fuzz_targets/roundtrip_zstd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_lz4"
+path = "fuzz_targets/roundtrip_lz4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_gzip"
+path = "fuzz_targets/roundtrip_gzip.rs"
+test = false
+doc = false
+bench = false
