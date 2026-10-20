@@ -47,32 +47,3 @@ pub(crate) unsafe extern "C" fn copyback_hook(
     let copybacks = unsafe { &mut *(ctx as *mut Copybacks) };
     copybacks.push(destination, offset, len);
 }
-
-/// The three copyback methods every decoder has, over its `Copybacks` (the `copybacks` field
-/// unless a path to it is given).
-macro_rules! copyback_methods {
-    () => {
-        copyback_methods!(copybacks);
-    };
-    ($($field:ident).+) => {
-        /// Turns the recording of LZ matches on or off; it is on when the decoder is
-        /// created. While it is off, the matches the decoder decodes are ignored.
-        pub fn set_copybacks_tracking(&mut self, enabled: bool) {
-            self.$($field).+.tracking = enabled;
-        }
-
-        /// Matches shorter than `min_len` bytes are not recorded; 1 when the decoder is
-        /// created, so every match is.
-        pub fn set_copybacks_min_len(&mut self, min_len: u32) {
-            self.$($field).+.min_len = min_len;
-        }
-
-        /// Every LZ match recorded so far, in stream order. The decoder only pushes to the
-        /// back of the queue; removing entries is up to the caller.
-        pub fn peek_copybacks(&mut self) -> &mut std::collections::VecDeque<crate::Copyback> {
-            &mut self.$($field).+.queue
-        }
-    };
-}
-
-pub(crate) use copyback_methods;

@@ -1,41 +1,32 @@
-//! Helpers shared by the integration tests: one interface over the four decoders, a
-//! reader that checks when copybacks arrive, the invariants every copyback list must
-//! satisfy, and test data with encoders.
+//! Helpers shared by the integration tests: the decoders by codec, a reader that checks when
+//! copybacks arrive, the invariants every copyback list must satisfy, and test data with
+//! encoders.
 #![allow(dead_code)]
 
-use lz_copyback::Copyback;
+use lz_copyback::gzip::GzipInPlaceDecoder;
+use lz_copyback::lz4::Lz4InPlaceDecoder;
+use lz_copyback::xz::XzInPlaceDecoder;
+use lz_copyback::zstd::ZstdInPlaceDecoder;
+use lz_copyback::{Copyback, InPlaceDecoder};
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::Write;
 
-/// The three copyback methods every fork adds, plus `Read`.
-pub trait CopybackReader: Read {
-    fn tracking(&mut self, enabled: bool);
-    fn min_len(&mut self, min_len: u32);
-    fn copybacks(&mut self) -> &mut VecDeque<Copyback>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Codec {
+    Xz,
+    Zstd,
+    Lz4,
+    Gzip,
 }
 
-macro_rules! copyback_reader {
-    ($(impl[$($generics:tt)*] for $decoder:ty;)*) => {$(
-        impl<$($generics)*> CopybackReader for $decoder {
-            fn tracking(&mut self, enabled: bool) {
-                self.set_copybacks_tracking(enabled);
-            }
-            fn min_len(&mut self, min_len: u32) {
-                self.set_copybacks_min_len(min_len);
-            }
-            fn copybacks(&mut self) -> &mut VecDeque<Copyback> {
-                self.peek_copybacks()
-            }
-        }
-    )*};
-}
-
-copyback_reader! {
-    impl[R: Read] for lz_copyback::xz::XzDecoder<R>;
-    impl[R: std::io::BufRead] for lz_copyback::zstd::ZstdDecoder<R>;
-    impl[R: Read] for lz_copyback::lz4::Lz4Decoder<R>;
-    impl[R: Read] for lz_copyback::gzip::GzipDecoder<R>;
+/// The decoder of `codec` over `encoded`, keeping `retain` bytes readable.
+pub fn decoder(codec: Codec, encoded: &[u8], retain: usize) -> Box<dyn InPlaceDecoder + '_> {
+    match codec {
+        Codec::Xz => Box::new(XzInPlaceDecoder::new_multi_decoder(encoded, retain)),
+        Codec::Zstd => Box::new(ZstdInPlaceDecoder::new(encoded, retain).unwrap()),
+        Codec::Lz4 => Box::new(Lz4InPlaceDecoder::new(encoded, retain).unwrap()),
+        Codec::Gzip => Box::new(GzipInPlaceDecoder::new(encoded, retain)),
+    }
 }
 
 /// What a decoder produced: its output and every copyback, in the order they were pushed.
@@ -44,27 +35,60 @@ pub struct Drained {
     pub copybacks: Vec<Copyback>,
 }
 
-/// Read `decoder` to the end in calls of `read_size` bytes, taking the copybacks out of its
-/// queue after every call. A copyback must arrive no later than the call that returns its
-/// first destination byte: pushing one for bytes already handed out fails the test.
-pub fn drain(decoder: &mut impl CopybackReader, read_size: usize) -> Drained {
+/// Reads `decoder` to the end as a consumer of chunks does: `chunk` bytes at a time, decoding
+/// `ahead` bytes past each first (the decoder must retain `chunk + ahead`), and taking the
+/// copybacks queued after each step. A copyback must arrive no later than the step that
+/// decodes its first destination byte: one pushed for bytes already handed out fails the test.
+pub fn try_drain(decoder: &mut dyn InPlaceDecoder, chunk: usize, ahead: usize) -> std::io::Result<Drained> {
     let mut out = Vec::new();
     let mut copybacks = Vec::new();
-    let mut buffer = vec![0; read_size];
     loop {
-        let delivered = out.len() as u64;
-        let count = decoder.read(&mut buffer).expect("decode error");
-        for copyback in decoder.copybacks().drain(..) {
+        let position = out.len() as u64;
+        let decoded = decoder.decode_to(position + (chunk + ahead) as u64)?;
+        let end = decoded.min(position + chunk as u64);
+        let (pieces, queue) = decoder.bytes_and_copybacks(position..end);
+        for piece in pieces {
+            out.extend_from_slice(piece);
+        }
+        for copyback in queue.drain(..) {
             assert!(
-                copyback.destination >= delivered,
-                "{copyback:?} pushed after {delivered} bytes were handed out"
+                copyback.destination >= position,
+                "{copyback:?} pushed after {position} bytes were handed out"
             );
             copybacks.push(copyback);
         }
-        if count == 0 {
-            return Drained { out, copybacks };
+        if end == position {
+            return Ok(Drained { out, copybacks });
         }
-        out.extend_from_slice(&buffer[..count]);
+    }
+}
+
+pub fn drain(decoder: &mut dyn InPlaceDecoder, chunk: usize, ahead: usize) -> Drained {
+    try_drain(decoder, chunk, ahead).expect("decode error")
+}
+
+/// The whole of `encoded`, decoded by the decoder of `codec`, read in 64 KiB chunks with
+/// 1 MiB of look-ahead, as ggcat reads it.
+pub fn full(codec: Codec, encoded: &[u8]) -> Drained {
+    let (chunk, ahead) = (64 << 10, 1 << 20);
+    drain(&mut *decoder(codec, encoded, chunk + ahead), chunk, ahead)
+}
+
+/// The whole output of `decoder`, from its first byte (which must still be readable) to the
+/// end, read a chunk at a time, leaving its copyback queue alone.
+pub fn read_out(decoder: &mut dyn InPlaceDecoder, chunk: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut position = 0;
+    loop {
+        let decoded = decoder.decode_to(position + chunk as u64).expect("decode error");
+        let end = decoded.min(position + chunk as u64);
+        if end == position {
+            return out;
+        }
+        for piece in decoder.bytes(position..end) {
+            out.extend_from_slice(piece);
+        }
+        position = end;
     }
 }
 

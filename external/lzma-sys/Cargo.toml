@@ -4,7 +4,7 @@
 edition = "2021"
 rust-version = "1.60"
 name = "lzcb-lzma-sys"
-version = "0.2.0+xz.5.8.4"
+version = "0.3.0+xz.5.8.4"
 authors = [
     "Alex Crichton <alex@alexcrichton.com>",
     "Portable-Network-Archive Developers",
@@ -20,7 +20,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Fork of liblzma-sys 0.4.9 (XZ Utils 5.8.4) whose LZ decoder reports every match through a hook and whose C symbols are prefixed, for the lz-copyback crate."
+description = "Fork of liblzma-sys 0.4.9 (XZ Utils 5.8.4) that decodes in place only, reading the output from its dictionary, reports every LZ match through a hook and prefixes its C symbols, for the lz-copyback crate."
 homepage = "https://github.com/portable-network-archive/liblzma-rs"
 readme = "README.md"
 keywords = [

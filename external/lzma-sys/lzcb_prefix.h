@@ -317,6 +317,12 @@
 #ifndef lzma_lz_encoder_memusage
 #define lzma_lz_encoder_memusage lzcb_lzma_lz_encoder_memusage
 #endif
+#ifndef lzma_lz_in_place_block
+#define lzma_lz_in_place_block lzcb_lzma_lz_in_place_block
+#endif
+#ifndef lzma_lz_in_place_free
+#define lzma_lz_in_place_free lzcb_lzma_lz_in_place_free
+#endif
 #ifndef lzma_lzip_decoder
 #define lzma_lzip_decoder lzcb_lzma_lzip_decoder
 #endif
@@ -391,6 +397,9 @@
 #endif
 #ifndef lzma_lzma_props_encode
 #define lzma_lzma_props_encode lzcb_lzma_lzma_props_encode
+#endif
+#ifndef lzma_lz_set_in_place
+#define lzma_lz_set_in_place lzcb_lzma_lz_set_in_place
 #endif
 #ifndef lzma_lz_set_match_hook
 #define lzma_lz_set_match_hook lzcb_lzma_lz_set_match_hook

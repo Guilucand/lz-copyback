@@ -99,6 +99,11 @@ typedef struct {
 	/// read beyond the beginning of the dictionary.
 	size_t full;
 
+	/// ggcat in-place decoding: until the dictionary has wrapped, full is
+	/// pos - full_base. LZ_DICT_INIT_POS, unless a reset left the decoded
+	/// bytes in place and restarted after them (see lz_decoder.c).
+	size_t full_base;
+
 	/// Write limit
 	size_t limit;
 
@@ -143,6 +148,60 @@ extern void lzma_lz_set_match_hook(lzma_lz_match_hook hook, void *ctx,
 /// returning the previous setting. The block decoder suppresses it while it
 /// decodes a block whose LZ output is transformed again by another filter.
 extern bool lzma_lz_suppress_match_hook(bool suppress);
+
+
+/// ggcat in-place decoding, the only way this fork decodes: the caller reads
+/// the decoded bytes straight from the dictionary, where the LZ decoder wrote
+/// them, instead of having them copied into its output buffer.
+///
+/// To do so the caller passes, as the output buffer of lzma_code(), the
+/// dictionary itself at the position the next byte will be decoded at, which
+/// this state tells. The LZ decoder then skips the copy, and everything else
+/// (the integrity checks included) reads the bytes where they are. A decoding
+/// step whose output buffer is not there decodes nothing and returns, so that
+/// the caller can call again with the right one: after a wrap of the
+/// dictionary, a reset or a new dictionary, the position moves. Without a
+/// state, the LZ decoder cannot be initialised (LZMA_PROG_ERROR).
+///
+/// A reset keeps the bytes decoded so far where they are (the dictionary
+/// restarts right after them), and a dictionary that liblzma would free,
+/// because it is too small for the next block or its filter chain is
+/// replaced, is handed to the caller through `retire` instead, so that the
+/// bytes still in it stay readable; the caller frees it with
+/// lzma_lz_in_place_free(). Preset dictionaries are not supported.
+typedef struct {
+	/// The smallest dictionary allocated, set by the caller, so that the
+	/// bytes it still needs are not overwritten by the next ones.
+	size_t min_size;
+
+	/// The current dictionary buffer, with `size` usable bytes.
+	uint8_t *buf;
+	size_t size;
+
+	/// Index in buf of the next byte to be decoded.
+	size_t next;
+
+	/// True while the block being decoded has a filter in front of LZMA2:
+	/// its output is not in the dictionary, so the caller must give a
+	/// buffer of its own, outside the dictionary, until the block ends.
+	bool filtered;
+
+	/// Called with a dictionary that liblzma no longer uses.
+	void (*retire)(void *ctx, uint8_t *buf, size_t size);
+	void *retire_ctx;
+} lzma_lz_in_place;
+
+/// Install the calling thread's in-place state (NULL removes it). Like the
+/// match hook, it must be set around every lzma_code() call.
+extern void lzma_lz_set_in_place(lzma_lz_in_place *state);
+
+/// Free a dictionary handed over by `retire`.
+extern void lzma_lz_in_place_free(uint8_t *buf);
+
+/// Called by the block decoder before every decoding step: records whether
+/// the block is `filtered`, and returns true if it is and `out` is in the
+/// dictionary, in which case the step must not be run.
+extern bool lzma_lz_in_place_block(bool filtered, const uint8_t *out);
 
 
 typedef struct {
@@ -312,7 +371,7 @@ dict_repeat(lzma_dict *restrict dict,
 
 	// Update how full the dictionary is.
 	if (!dict->has_wrapped)
-		dict->full = dict->pos - LZ_DICT_INIT_POS;
+		dict->full = dict->pos - dict->full_base;
 
 	return *len != 0;
 }
@@ -324,7 +383,7 @@ dict_put(lzma_dict *restrict dict, uint8_t byte)
 	dict->buf[dict->pos++] = byte;
 
 	if (!dict->has_wrapped)
-		dict->full = dict->pos - LZ_DICT_INIT_POS;
+		dict->full = dict->pos - dict->full_base;
 }
 
 
@@ -361,7 +420,7 @@ dict_write(lzma_dict *restrict dict, const uint8_t *restrict in,
 			dict->buf, &dict->pos, dict->limit);
 
 	if (!dict->has_wrapped)
-		dict->full = dict->pos - LZ_DICT_INIT_POS;
+		dict->full = dict->pos - dict->full_base;
 
 	return;
 }

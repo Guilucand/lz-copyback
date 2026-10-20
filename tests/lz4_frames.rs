@@ -79,14 +79,13 @@ fn reported_matches_are_exactly_the_frame_sequences() {
             let (expected, size) = frame_matches(&encoded);
             assert_eq!(size, data.len() as u64);
             assert!(!expected.is_empty());
-            // Small reads go through liblz4's own block buffer, large ones decode in place.
-            for read_size in [7, 1 << 16, 8 << 20] {
-                let mut decoder = lz_copyback::lz4::Lz4Decoder::new(&encoded[..]).unwrap();
-                let drained = common::drain(&mut decoder, read_size);
+            for (chunk, ahead) in [(7, 0), (1 << 16, 1 << 20), (8 << 20, 0)] {
+                let mut decoder = lz_copyback::lz4::Lz4InPlaceDecoder::new(&encoded[..], chunk + ahead).unwrap();
+                let drained = common::drain(&mut decoder, chunk, ahead);
                 assert_eq!(drained.out, data);
                 assert!(
                     drained.copybacks == expected,
-                    "linked {linked}, {block_size:?}, read size {read_size}: {} reported, {} in the frame",
+                    "linked {linked}, {block_size:?}, chunk {chunk}: {} reported, {} in the frame",
                     drained.copybacks.len(),
                     expected.len()
                 );

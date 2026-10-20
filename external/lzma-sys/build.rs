@@ -150,7 +150,9 @@ fn main() {
         build.include("wasm-shim/");
     }
 
-    build.compile("liblzma.a");
+    // lzcb: not liblzma.a. The archive's directory is on the final link's search path, where it
+    // would otherwise stand in for a system liblzma that a crate links with -llzma.
+    build.compile("liblzcb_lzma.a");
 }
 
 fn read_dir_files(dir: &str) -> impl Iterator<Item = PathBuf> {

@@ -1,30 +1,14 @@
-//! lz4 frame decoding over the patched liblz4 in `external/lz4-sys`, with the interface of
-//! `lz4::Decoder`.
+//! lz4 frame decoding in place, over the patched liblz4 in `external/lz4-sys`.
 
-use crate::copybacks::{copyback_hook, copyback_methods, Copybacks};
+use crate::copybacks::{copyback_hook, Copybacks};
+use crate::in_place::{protected, ring_too_small, InPlaceDecoder, Pieces, RingMap};
+use crate::Copyback;
 use lzcb_lz4_sys as ffi;
+use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::io::{self, ErrorKind, Read};
-use std::ptr;
-
-const INPUT_BUFFER_SIZE: usize = 32 * 1024;
-
-/// An lz4 frame decoder over a [`Read`] that also records the LZ matches it decodes.
-///
-/// lz4 decodes a whole block (64 KiB to 4 MiB, as the frame says) at once, into a buffer of
-/// its own when the caller's is smaller, so a match is recorded during the `read` call that
-/// returns the first byte of its block, possibly before the call that returns its own
-/// bytes. Like upstream, the decoder stops after the first frame.
-pub struct Lz4Decoder<R> {
-    reader: R,
-    context: Context,
-    copybacks: Copybacks,
-    buf: Box<[u8]>,
-    pos: usize,
-    len: usize,
-    /// liblz4's hint of how many input bytes it expects next; 0 once the frame has ended.
-    next: usize,
-}
+use std::ops::Range;
+use std::ptr::{self, NonNull};
 
 /// The lz4 frame decompression context, freed on drop.
 struct Context(ffi::LZ4FDecompressionContext);
@@ -38,20 +22,74 @@ impl Drop for Context {
 // The context is only reached through `&mut self`.
 unsafe impl Sync for Context {}
 
-impl<R: Read> Lz4Decoder<R> {
-    /// Decodes the lz4 frame read from `reader`.
-    pub fn new(reader: R) -> io::Result<Self> {
+/// `code` if it is not an lz4 frame error code.
+fn check(code: ffi::LZ4FErrorCode) -> io::Result<usize> {
+    if unsafe { ffi::LZ4F_isError(code) } == 0 {
+        return Ok(code);
+    }
+    let name = unsafe { CStr::from_ptr(ffi::LZ4F_getErrorName(code)) };
+    Err(io::Error::other(format!("LZ4 error: {}", name.to_string_lossy())))
+}
+
+/// The largest lz4 block (4 MiB, `LZ4F_max4MB`).
+const MAX_BLOCK: usize = 4 << 20;
+
+/// Room past a block for the decoder's writes beyond its decoded bytes.
+const BLOCK_SLACK: usize = 64;
+
+/// The smallest frame header: the first input asked for.
+const HEADER_MIN: usize = 7;
+
+/// An lz4 frame from any reader, decoded in place: each block is decoded straight into a
+/// ring buffer (see [`InPlaceDecoder`]), the input being fed as liblz4 asks for it, a block
+/// at a time. Like upstream's decoder, it stops after the first frame; an input that ends
+/// inside it is an error. A match is recorded when its block (64 KiB to 4 MiB, as the frame
+/// says) is decoded, possibly a block ahead of the bytes asked for.
+pub struct Lz4InPlaceDecoder<R> {
+    reader: R,
+    context: Context,
+    copybacks: Copybacks,
+    ring: NonNull<u8>,
+    ring_len: usize,
+    write: usize,
+    map: RingMap,
+    /// The input read and how much of it liblz4 took.
+    input: Vec<u8>,
+    input_pos: usize,
+    /// liblz4's hint of how many input bytes it expects next; 0 once the frame has ended.
+    next: usize,
+    retain: usize,
+    total_in: u64,
+}
+
+// SAFETY: the pointers point into the ring the decoder owns, and the context is only reached
+// through `&mut self`.
+unsafe impl<R: Send> Send for Lz4InPlaceDecoder<R> {}
+
+impl<R: Read> Lz4InPlaceDecoder<R> {
+    /// Decodes the lz4 frame read from `reader`, keeping the last `retain` bytes readable
+    /// (see [`InPlaceDecoder`]).
+    pub fn new(reader: R, retain: usize) -> io::Result<Self> {
         let mut context = ffi::LZ4FDecompressionContext(ptr::null_mut());
         check(unsafe { ffi::LZ4F_createDecompressionContext(&mut context, ffi::LZ4F_VERSION) })?;
-        Ok(Lz4Decoder {
+        // The retained bytes, a block decoded past them, a block of room for the next one,
+        // and what is wasted at the end of the ring when it wraps; liblz4 keeps 64 KiB of
+        // history before the block it decodes.
+        let ring_len = retain + 3 * (MAX_BLOCK + BLOCK_SLACK) + (64 << 10);
+        let buffer: Box<[u8]> = vec![0; ring_len].into_boxed_slice();
+        Ok(Self {
             reader,
             context: Context(context),
             copybacks: Copybacks::new(),
-            buf: vec![0; INPUT_BUFFER_SIZE].into_boxed_slice(),
-            pos: INPUT_BUFFER_SIZE,
-            len: INPUT_BUFFER_SIZE,
-            // The smallest lz4 frame.
-            next: 11,
+            ring: NonNull::new(Box::into_raw(buffer) as *mut u8).unwrap(),
+            ring_len,
+            write: 0,
+            map: RingMap::default(),
+            input: Vec::new(),
+            input_pos: 0,
+            next: HEADER_MIN,
+            retain,
+            total_in: 0,
         })
     }
 
@@ -60,87 +98,115 @@ impl<R: Read> Lz4Decoder<R> {
         &self.reader
     }
 
-    /// The underlying reader, and an error if the frame was not read to its end: a truncated
-    /// frame only shows here, since `read` then just stops returning bytes.
-    pub fn finish(self) -> (R, io::Result<()>) {
-        let result = match self.next {
-            0 => Ok(()),
-            _ => Err(io::Error::new(
-                ErrorKind::Interrupted,
-                "Finish runned before read end of compressed stream",
-            )),
+    /// Reads the input liblz4 asks for next, or as much of it as there is.
+    fn read_input(&mut self) -> io::Result<()> {
+        self.input.resize(self.next, 0);
+        let mut filled = 0;
+        while filled < self.next {
+            match self.reader.read(&mut self.input[filled..]) {
+                Ok(0) => break,
+                Ok(count) => filled += count,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if filled == 0 {
+            return Err(io::Error::new(ErrorKind::UnexpectedEof, "lz4: the input ends inside a frame"));
+        }
+        self.input.truncate(filled);
+        self.input_pos = 0;
+        self.total_in += filled as u64;
+        Ok(())
+    }
+
+    /// Feeds liblz4 the next input, decoding at most a block, straight into the ring.
+    fn step(&mut self, protect: u64) -> io::Result<()> {
+        if self.input_pos == self.input.len() {
+            self.read_input()?;
+        }
+        // liblz4 decodes a block in place only with room for the largest one.
+        let room = MAX_BLOCK + BLOCK_SLACK;
+        if self.write + room > self.ring_len {
+            self.write = 0;
+        }
+        if self.map.writable(self.ring, self.write, protect) < room {
+            return Err(ring_too_small("lz4"));
+        }
+        self.map.overwrite(self.ring, self.write, room);
+
+        let mut src_size = self.input.len() - self.input_pos;
+        let mut dst_size = self.ring_len - self.write;
+        let track = self.copybacks.tracking;
+        if track {
+            let min_len = self.copybacks.min_len;
+            let ctx = self.copybacks.hook_ctx();
+            unsafe { ffi::LZ4F_setLzMatchHook(self.context.0, Some(copyback_hook), ctx, min_len) };
+        }
+        let code = unsafe {
+            ffi::LZ4F_decompress(
+                self.context.0,
+                self.ring.as_ptr().add(self.write),
+                &mut dst_size,
+                self.input[self.input_pos..].as_ptr(),
+                &mut src_size,
+                ptr::null(),
+            )
         };
-        (self.reader, result)
-    }
-
-    copyback_methods!();
-}
-
-/// The same loop as upstream's decoder.
-impl<R: Read> Read for Lz4Decoder<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.next == 0 || buf.is_empty() {
-            return Ok(0);
+        if track {
+            unsafe { ffi::LZ4F_setLzMatchHook(self.context.0, None, ptr::null_mut(), 0) };
         }
-        let mut dst_offset = 0;
-        while dst_offset == 0 {
-            if self.pos >= self.len {
-                let need = self.buf.len().min(self.next);
-                self.len = self.reader.read(&mut self.buf[..need])?;
-                // Even with nothing read, the context may still have bytes to hand out.
-                self.pos = 0;
-                self.next -= self.len;
-            }
-            while dst_offset < buf.len() && (self.pos < self.len || self.len == 0) {
-                let mut src_size = self.len - self.pos;
-                let mut dst_size = buf.len() - dst_offset;
-                // The hook reports the matches of this call only, the short ones filtered
-                // out in C, at offsets counting every byte the context decoded since it was
-                // created.
-                let track = self.copybacks.tracking;
-                if track {
-                    let min_len = self.copybacks.min_len;
-                    let ctx = self.copybacks.hook_ctx();
-                    unsafe { ffi::LZ4F_setLzMatchHook(self.context.0, Some(copyback_hook), ctx, min_len) };
-                }
-                let code = unsafe {
-                    ffi::LZ4F_decompress(
-                        self.context.0,
-                        buf[dst_offset..].as_mut_ptr(),
-                        &mut dst_size,
-                        self.buf[self.pos..].as_ptr(),
-                        &mut src_size,
-                        ptr::null(),
-                    )
-                };
-                if track {
-                    unsafe { ffi::LZ4F_setLzMatchHook(self.context.0, None, ptr::null_mut(), 0) };
-                }
-                let hint = check(code)?;
-                self.pos += src_size;
-                dst_offset += dst_size;
-
-                // Keep asking until the context stops producing, even with no input left.
-                if dst_size == 0 && src_size == 0 {
-                    return Ok(dst_offset);
-                }
-                if hint == 0 {
-                    self.next = 0;
-                    return Ok(dst_offset);
-                } else if self.next < hint {
-                    self.next = hint;
-                }
-            }
-        }
-        Ok(dst_offset)
+        self.next = check(code)?;
+        self.input_pos += src_size;
+        self.map.push(self.ring, self.write, dst_size);
+        self.write += dst_size;
+        Ok(())
     }
 }
 
-/// `code` if it is not an lz4 frame error code.
-fn check(code: ffi::LZ4FErrorCode) -> io::Result<usize> {
-    if unsafe { ffi::LZ4F_isError(code) } == 0 {
-        return Ok(code);
+impl<R: Read> InPlaceDecoder for Lz4InPlaceDecoder<R> {
+    fn decode_to(&mut self, target: u64) -> io::Result<u64> {
+        let protect = protected(target, self.retain);
+        while self.next != 0 && self.map.end() < target {
+            self.step(protect)?;
+        }
+        Ok(self.map.end())
     }
-    let name = unsafe { CStr::from_ptr(ffi::LZ4F_getErrorName(code)) };
-    Err(io::Error::other(format!("LZ4 error: {}", name.to_string_lossy())))
+
+    fn decoded_len(&self) -> u64 {
+        self.map.end()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.next == 0
+    }
+
+    fn bytes(&self, range: Range<u64>) -> Pieces<'_> {
+        self.map.pieces(range)
+    }
+
+    fn bytes_and_copybacks(&mut self, range: Range<u64>) -> (Pieces<'_>, &mut VecDeque<Copyback>) {
+        (self.map.pieces(range), &mut self.copybacks.queue)
+    }
+
+    fn peek_copybacks(&mut self) -> &mut VecDeque<Copyback> {
+        &mut self.copybacks.queue
+    }
+
+    fn set_copybacks_tracking(&mut self, enabled: bool) {
+        self.copybacks.tracking = enabled;
+    }
+
+    fn set_copybacks_min_len(&mut self, min_len: u32) {
+        self.copybacks.min_len = min_len;
+    }
+
+    fn total_in(&self) -> u64 {
+        self.total_in
+    }
+}
+
+impl<R> Drop for Lz4InPlaceDecoder<R> {
+    fn drop(&mut self) {
+        drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(self.ring.as_ptr(), self.ring_len)) });
+    }
 }

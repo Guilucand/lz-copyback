@@ -6,9 +6,9 @@
 # Run on LINUX. macOS `nm` prepends an underscore to every C symbol, which would send
 # every entry down the Mach-O branch below and corrupt the output.
 #
-#   ./tools/gen-symbol-prefix.sh zstd-sys libzstd.a
-#   ./tools/gen-symbol-prefix.sh lzma-sys liblzma.a
-#   ./tools/gen-symbol-prefix.sh lz4-sys liblz4.a
+#   ./tools/gen-symbol-prefix.sh zstd-sys liblzcb_zstd.a
+#   ./tools/gen-symbol-prefix.sh lzma-sys liblzcb_lzma.a
+#   ./tools/gen-symbol-prefix.sh lz4-sys liblzcb_lz4.a
 set -euo pipefail
 
 crate=$1

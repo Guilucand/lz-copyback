@@ -52,17 +52,22 @@ That takes the archive from 581 exported symbols to 348. A legacy v0.x frame is 
   sequence is executed whole and never spans blocks, so every match is reported once, with
   its full length.
 * `zstd/lib/decompress/zstd_decompress.c`: fields initialised in `ZSTD_initDCtx_internal`;
-  `lzTotalOut` advanced per block in `ZSTD_decompressContinue` (streaming) and
-  `ZSTD_decompressFrame` (one-shot); the two new API functions. Nothing else resets
-  `lzTotalOut` -- not `ZSTD_DCtx_reset`, not the start of a frame -- so the offsets run on
-  across frames for the life of the context. In buffered output mode (the default) a block
-  is decoded into zstd's own buffer and flushed later, so its matches are reported up to
-  one block before their bytes reach the caller.
+  `lzTotalOut` advanced per block in `ZSTD_decompressContinue`, the buffer-less API that
+  `ZstdInPlaceDecoder` decodes with (and that the streaming API runs on); the two new API
+  functions. The one-shot `ZSTD_decompressFrame`, which the streaming API also takes when a
+  whole frame fits its output, does not count: its matches are reported with wrong offsets,
+  and only the buffer-less API is supported. Nothing else resets `lzTotalOut` -- not
+  `ZSTD_DCtx_reset`, not the start of a frame -- so the offsets run on across frames for the
+  life of the context.
 * `src/lib.rs`: hand-written declarations of `ZSTD_DCtx_setLzMatchHook` and
-  `ZSTD_DCtx_getLzTotalOut`, so the pregenerated bindings are untouched.
+  `ZSTD_DCtx_getLzTotalOut`, and of the buffer-less streaming API (`ZSTD_getFrameHeader`,
+  `ZSTD_decodingBufferSize_min`, `ZSTD_decompressBegin`, `ZSTD_nextSrcSizeToDecompress`,
+  `ZSTD_decompressContinue`, `ZSTD_nextInputType`, `ZSTD_FrameHeader`), which is in
+  zstd's static-linking-only section and so not in the pregenerated bindings; they are
+  untouched. `ZstdInPlaceDecoder` decodes with it, each block straight into its own ring.
 * `build.rs`: re-runs when the patched files change.
 
-The Rust side (`../../src/zstd.rs`) installs the hook around every `ZSTD_decompressStream`
+The Rust side (`../../src/zstd.rs`) installs the hook around every `ZSTD_decompressContinue`
 call and clears it afterwards.
 
 ## Packaging for crates.io (lzcb fork)
@@ -79,8 +84,11 @@ This tree is published as **`lzcb-zstd-sys`**, not as `zstd-sys`, so that a proj
    crate's calls to the other library.
 3. **The Rust bindings carry `#[link_name = "lzcb_..."]`**, so the Rust-visible API keeps
    upstream's names.
+4. **The archive is `liblzcb_zstd.a`**, not `libzstd.a`. Its directory goes on the search path of the
+   final link, where a `libzstd.a` would be taken for the `-lzstd` of a crate linking the system
+   library, whose symbols then come out undefined.
 
-`lzcb_prefix.h` is generated, not hand-written: `tools/gen-symbol-prefix.sh zstd-sys libzstd.a`
+`lzcb_prefix.h` is generated, not hand-written: `tools/gen-symbol-prefix.sh zstd-sys liblzcb_zstd.a`
 builds the archive with `LZCB_NO_PREFIX=1` (the escape hatch that breaks the bootstrap
 cycle), reads its symbol table and writes the header. `tests/symbols.rs` re-reads the built
 archive and fails, naming the offenders, if any global definition lost its prefix -- that is
@@ -106,7 +114,7 @@ the guard for an upstream bump that adds a symbol.
    zstd C sources of 2.1.2 are identical to 2.0.16's, so that bump only took the Rust side.
 2. `git apply -p1 ../../tools/../external/zstd-sys/ggcat-lz-hook.patch` from the crate
    directory and resolve any conflicts.
-3. Re-run `../../tools/gen-symbol-prefix.sh zstd-sys libzstd.a` -- the symbol list is not
+3. Re-run `../../tools/gen-symbol-prefix.sh zstd-sys liblzcb_zstd.a` -- the symbol list is not
    stable across versions.
 4. Re-run `python3 ../../tools/add-link-names.py external/zstd-sys/src/bindings_zstd.rs` if the bindings were
    regenerated.

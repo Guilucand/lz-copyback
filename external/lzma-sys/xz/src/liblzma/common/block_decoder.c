@@ -75,6 +75,13 @@ block_decode(void *coder_ptr, const lzma_allocator *allocator,
 
 	switch (coder->sequence) {
 	case SEQ_CODE: {
+		// ggcat in-place decoding: the output of a filtered block is
+		// not in the dictionary, so it cannot be decoded there: let
+		// the caller call again with a buffer of its own.
+		if (lzma_lz_in_place_block(coder->lz_hook_suppressed,
+				(const uint8_t *)((uintptr_t)out + *out_pos)))
+			return LZMA_OK;
+
 		const size_t in_start = *in_pos;
 		const size_t out_start = *out_pos;
 

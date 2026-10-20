@@ -153,7 +153,9 @@ fn compile_zstd() {
      * 7+: events at every position (*very* verbose)
      */
     // Compile!
-    config.compile("libzstd.a");
+    // lzcb: not libzstd.a. The archive's directory is on the final link's search path, where it
+    // would otherwise stand in for a system libzstd that a crate links with -lzstd.
+    config.compile("liblzcb_zstd.a");
 
     let src = env::current_dir().unwrap().join("zstd").join("lib");
     let dst = PathBuf::from(env::var_os("OUT_DIR").unwrap());

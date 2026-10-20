@@ -4,7 +4,7 @@
 edition = "2018"
 rust-version = "1.64"
 name = "lzcb-zstd-sys"
-version = "0.2.0+zstd.1.5.7"
+version = "0.3.0+zstd.1.5.7"
 authors = ["Alexandre Bury <alexandre.bury@gmail.com>"]
 build = "build.rs"
 links = "lzcb_zstd"

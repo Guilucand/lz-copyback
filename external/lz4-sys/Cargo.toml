@@ -2,7 +2,7 @@
 
 [package]
 name = "lzcb-lz4-sys"
-version = "0.1.0+lz4-1.10.0"
+version = "0.1.1+lz4-1.10.0"
 authors = [
     "Jens Heyens <jens.heyens@ewetel.net>",
     "Artem V. Navrotskiy <bozaro@buzzsoft.ru>",

@@ -1,20 +1,27 @@
 //! Decoding throughput of each decoder with copyback tracking off and on, next to the stock
-//! decoder whose interface it reproduces. Every configuration decodes its input once, from
-//! memory, reading `--read-size` bytes per call and emptying the copyback queue after each.
+//! decoder of its format. Every configuration decodes its input once, from memory. The stock
+//! decoders are read `--read-size` bytes per call; the decoders here as a consumer of chunks
+//! reads them: `--read-size` bytes at a time, decoding `--window` bytes past each chunk first,
+//! and emptying the copyback queue after each.
 //!
 //! ```text
-//! cargo bench --bench decode -- [--synthetic-mib N] [--read-size BYTES]
-//!                               [--real FILE.xz --scratch DIR]
+//! cargo bench --bench decode -- [--synthetic-mib N] [--read-size BYTES] [--window BYTES]
+//!                               [--real FILE.xz --scratch DIR] [--threads N] [--pause SECONDS]
 //! ```
+//!
+//! With `--threads`, every configuration runs on that many threads at once, each decoding the
+//! same input, started together; the throughput is all their bytes over the wall time.
+//! `--pause` idles that long before each configuration, so that the clocks recover.
 //!
 //! The synthetic input is a batch of near-identical genomes (long repeats one genome apart),
 //! encoded with each codec. `--real` adds an `.xz` file as shipped, plus its content
 //! recompressed to gzip, zstd and lz4; the recompressed files are cached in `DIR`.
 
-use lz_copyback::Copyback;
-use std::collections::VecDeque;
+use lz_copyback::InPlaceDecoder;
+use std::hint::black_box;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Barrier;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -58,22 +65,13 @@ struct Run {
     max_queue: usize,
 }
 
-/// Reads `reader` to the end in `read_size` calls, emptying its copyback queue after each.
-fn run<R: Read>(
-    mut reader: R,
-    read_size: usize,
-    mut queue: impl FnMut(&mut R) -> Option<&mut VecDeque<Copyback>>,
-) -> Run {
+/// Reads a stock decoder to the end in `read_size` calls.
+fn run(mut reader: impl Read, read_size: usize) -> Run {
     let mut buffer = vec![0u8; read_size];
     let mut result = Run::default();
     let start = Instant::now();
     loop {
         let count = reader.read(&mut buffer).expect("decode error");
-        if let Some(queue) = queue(&mut reader) {
-            result.max_queue = result.max_queue.max(queue.len());
-            result.copybacks += queue.len() as u64;
-            result.covered += queue.drain(..).map(|c| c.len as u64).sum::<u64>();
-        }
         if count == 0 {
             break;
         }
@@ -83,36 +81,94 @@ fn run<R: Read>(
     result
 }
 
-fn bench(input: &Input, config: Config, read_size: usize) -> Run {
+/// Reads `decoder` to the end a chunk of `chunk` bytes at a time, decoding `window` bytes past
+/// each first, and taking the chunk's pieces and the copybacks queued so far.
+fn run_in_place(mut decoder: Box<dyn InPlaceDecoder + '_>, chunk: usize, window: usize) -> Run {
+    let mut result = Run::default();
+    let start = Instant::now();
+    let mut position = 0;
+    loop {
+        let decoded = decoder.decode_to(position + (chunk + window) as u64).expect("decode error");
+        let end = decoded.min(position + chunk as u64);
+        let (pieces, queue) = decoder.bytes_and_copybacks(position..end);
+        for piece in pieces {
+            black_box(piece);
+        }
+        result.max_queue = result.max_queue.max(queue.len());
+        result.copybacks += queue.len() as u64;
+        result.covered += queue.drain(..).map(|c| c.len as u64).sum::<u64>();
+        if end == position {
+            break;
+        }
+        result.bytes += end - position;
+        position = end;
+    }
+    result.time = start.elapsed();
+    result
+}
+
+fn bench(input: &Input, config: Config, read_size: usize, window: usize) -> Run {
     let encoded = &input.encoded[..];
     let (tracking, min_len) = match config {
-        Config::Stock | Config::Off => (false, 1),
+        Config::Stock => {
+            let result = match input.codec {
+                Codec::Xz => run(liblzma::read::XzDecoder::new_multi_decoder(encoded), read_size),
+                Codec::Zstd => run(zstd::stream::read::Decoder::new(encoded).unwrap(), read_size),
+                Codec::Lz4 => run(lz4::Decoder::new(encoded).unwrap(), read_size),
+                Codec::Gzip => run(StockGzip::new(encoded, read_size), read_size),
+            };
+            assert_eq!(result.bytes, input.decoded_len, "{} stock: wrong output size", input.name);
+            return result;
+        }
+        Config::Off => (false, 1),
         Config::On(min_len) => (true, min_len),
     };
-    macro_rules! ours {
-        ($decoder:expr) => {{
-            let mut decoder = $decoder;
-            decoder.set_copybacks_tracking(tracking);
-            decoder.set_copybacks_min_len(min_len);
-            run(decoder, read_size, |d| Some(d.peek_copybacks()))
-        }};
-    }
-    let result = match (input.codec, config) {
-        (Codec::Xz, Config::Stock) => run(liblzma::read::XzDecoder::new_multi_decoder(encoded), read_size, |_| None),
-        (Codec::Xz, _) => ours!(lz_copyback::xz::XzDecoder::new_multi_decoder(encoded)),
-        (Codec::Zstd, Config::Stock) => run(zstd::stream::read::Decoder::new(encoded).unwrap(), read_size, |_| None),
-        (Codec::Zstd, _) => ours!(lz_copyback::zstd::ZstdDecoder::new(encoded).unwrap()),
-        (Codec::Lz4, Config::Stock) => run(lz4::Decoder::new(encoded).unwrap(), read_size, |_| None),
-        (Codec::Lz4, _) => ours!(lz_copyback::lz4::Lz4Decoder::new(encoded).unwrap()),
-        (Codec::Gzip, Config::Stock) => run(StockGzip::new(encoded, read_size), read_size, |_| None),
-        (Codec::Gzip, _) => ours!(lz_copyback::gzip::GzipDecoder::with_buffer_size(encoded, read_size)),
+    let retain = read_size + window;
+    let mut decoder: Box<dyn InPlaceDecoder> = match input.codec {
+        Codec::Xz => Box::new(lz_copyback::xz::XzInPlaceDecoder::new_multi_decoder(encoded, retain)),
+        Codec::Zstd => Box::new(lz_copyback::zstd::ZstdInPlaceDecoder::new(encoded, retain).unwrap()),
+        Codec::Lz4 => Box::new(lz_copyback::lz4::Lz4InPlaceDecoder::new(encoded, retain).unwrap()),
+        Codec::Gzip => Box::new(lz_copyback::gzip::GzipInPlaceDecoder::new(encoded, retain)),
     };
+    decoder.set_copybacks_tracking(tracking);
+    decoder.set_copybacks_min_len(min_len);
+    let result = run_in_place(decoder, read_size, window);
     assert_eq!(result.bytes, input.decoded_len, "{} {:?}: wrong output size", input.name, config.label());
     result
 }
 
-/// streaming-libdeflate-rs's own push decompressor, read the way `GzipDecoder` reads its
-/// port of it.
+/// Runs `config` on `threads` threads at once, each decoding the whole input, and returns the
+/// wall time from their common start to the last one's end, with each thread's run.
+fn bench_threads(input: &Input, config: Config, read_size: usize, window: usize, threads: usize) -> (Duration, Vec<Run>) {
+    let barrier = Barrier::new(threads + 1);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    bench(input, config, read_size, window)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let start = Instant::now();
+        let runs: Vec<Run> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        (start.elapsed(), runs)
+    })
+}
+
+/// The mean clock of the cores, where Linux tells it.
+fn mean_mhz() -> Option<f64> {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    let clocks: Vec<f64> = cpuinfo
+        .lines()
+        .filter(|line| line.starts_with("cpu MHz"))
+        .filter_map(|line| line.split(':').nth(1)?.trim().parse().ok())
+        .collect();
+    (!clocks.is_empty()).then(|| clocks.iter().sum::<f64>() / clocks.len() as f64)
+}
+
+/// streaming-libdeflate-rs's own push decompressor, as a `Read`.
 struct StockGzip<'a> {
     input: &'a [u8],
     decompressor: streaming_libdeflate_rs::LibdeflateGzipPushDecompressor,
@@ -272,6 +328,9 @@ fn real_inputs(path: &Path, scratch: &Path) -> Vec<Input> {
 fn main() {
     let mut synthetic_mib = 256;
     let mut read_size = 4 << 20;
+    let mut window = 1 << 20;
+    let mut threads = 1;
+    let mut pause = 0.0;
     let mut real = None;
     let mut scratch = None;
     let mut args = std::env::args().skip(1);
@@ -279,6 +338,9 @@ fn main() {
         match arg.as_str() {
             "--synthetic-mib" => synthetic_mib = args.next().unwrap().parse().unwrap(),
             "--read-size" => read_size = args.next().unwrap().parse().unwrap(),
+            "--window" => window = args.next().unwrap().parse().unwrap(),
+            "--threads" => threads = args.next().unwrap().parse().unwrap(),
+            "--pause" => pause = args.next().unwrap().parse().unwrap(),
             "--real" => real = Some(PathBuf::from(args.next().unwrap())),
             "--scratch" => scratch = Some(PathBuf::from(args.next().unwrap())),
             "--bench" => {} // passed by `cargo bench`
@@ -295,28 +357,40 @@ fn main() {
         inputs.extend(real_inputs(&real, &scratch));
     }
 
-    println!("read size {read_size} bytes; every configuration decodes its input once");
+    println!(
+        "read size {read_size} bytes, in-place window {window} bytes, {threads} threads, {pause} s pause; every configuration decodes its input once per thread"
+    );
     for input in &inputs {
         println!(
             "\n## {} {:?}: {} bytes -> {} bytes",
             input.name, input.codec, input.encoded.len(), input.decoded_len
         );
-        println!("| configuration | seconds | MB/s | vs stock | copybacks | bytes covered | max queue |");
-        println!("|---|---:|---:|---:|---:|---:|---:|");
+        println!(
+            "| configuration | wall seconds | MB/s | MB/s per thread | vs stock | copybacks per thread | bytes covered | max queue | MHz before |"
+        );
+        println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
         let mut stock = None;
-        for config in [Config::Stock, Config::Off, Config::On(62), Config::On(1)] {
-            let result = bench(input, config, read_size);
-            let seconds = result.time.as_secs_f64();
+        let configs = [Config::Stock, Config::Off, Config::On(62), Config::On(1)];
+        for config in configs {
+            std::thread::sleep(Duration::from_secs_f64(pause));
+            let mhz = mean_mhz().map_or("-".to_string(), |mhz| format!("{mhz:.0}"));
+            let (wall, runs) = bench_threads(input, config, read_size, window, threads);
+            let seconds = wall.as_secs_f64();
             let stock_seconds = *stock.get_or_insert(seconds);
+            let bytes: u64 = runs.iter().map(|run| run.bytes).sum();
+            let per_thread = runs.iter().map(|run| run.bytes as f64 / run.time.as_secs_f64()).sum::<f64>() / runs.len() as f64;
+            let first = &runs[0];
             println!(
-                "| {} | {:.3} | {:.0} | {:+.1}% | {} | {:.1}% | {} |",
+                "| {} | {:.3} | {:.0} | {:.0} | {:+.1}% | {} | {:.1}% | {} | {} |",
                 config.label(),
                 seconds,
-                result.bytes as f64 / seconds / 1e6,
+                bytes as f64 / seconds / 1e6,
+                per_thread / 1e6,
                 (seconds / stock_seconds - 1.0) * 100.0,
-                result.copybacks,
-                result.covered as f64 / result.bytes as f64 * 100.0,
-                result.max_queue,
+                first.copybacks,
+                first.covered as f64 / first.bytes as f64 * 100.0,
+                runs.iter().map(|run| run.max_queue).max().unwrap(),
+                mhz,
             );
         }
     }

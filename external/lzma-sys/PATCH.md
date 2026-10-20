@@ -54,15 +54,51 @@ every re-vendor, for about 60 symbols that the `lzcb_` prefix already isolates.
   copies the state into the dictionary before each `lz.code()` call (no hook while
   suppressed) and sets
   `abs_base = out_abs_base + *out_pos - dict_start`, which is exact because
-  `dict.buf[dict_start..pos]` is copied to `out[*out_pos..]` right after the call; the fields
-  are initialised in `lzma_lz_decoder_init()`.
+  `dict.buf[dict_start..pos]` is `out[*out_pos..]` (decoding in place, below; a filtered
+  Block's bytes are copied there, and report nothing); the fields are initialised in
+  `lzma_lz_decoder_init()`.
 * `xz/src/liblzma/common/block_decoder.c`: a Block whose filter chain is not a lone LZMA2
   suppresses the hook while it is decoded. A BCJ or delta filter in front of LZMA2 rewrites
   the LZ output in place, so its matches would not repeat output bytes, and BCJ may decode
   into a buffer of its own, which would also make the offsets wrong. `.lzma` and `.lz`
   streams have no filter chain and keep reporting.
-* `src/lib.rs`: the hand-written declaration of `lzma_lz_set_match_hook`.
+* `src/lib.rs`: the hand-written declarations of `lzma_lz_set_match_hook` and of the
+  in-place API below.
 * `build.rs`: always builds the bundled source and re-runs when the patched files change.
+
+### In-place decoding
+
+The only way this fork decodes, for `XzInPlaceDecoder`, which reads the decoded bytes straight
+from the dictionary instead of having them copied out of it. The caller installs a
+`lzma_lz_in_place` state for the thread with `lzma_lz_set_in_place()` around every
+`lzma_code` call, like the hook; without one the LZ decoder cannot be initialised
+(`LZMA_PROG_ERROR`). So this fork is no general-purpose liblzma anymore.
+
+* `lz_decoder.h`: the `lzma_lz_in_place` state and its functions; a `full_base` field in
+  `lzma_dict`, which the three updates of `full` subtract instead of `LZ_DICT_INIT_POS`.
+* `lz_decoder.c`:
+  * `decode_buffer()` decodes only if the output buffer is the dictionary at the decoding
+    position (the caller passes exactly that, from the state's `next`), and then skips the
+    copy: everything after it, the integrity checks included, reads the bytes where they
+    are. Otherwise it returns without decoding, and the caller calls again with the right
+    buffer: the position moves at a wrap, a reset or a new dictionary, never otherwise.
+  * A reset keeps the bytes decoded so far in place and restarts right after them, at the
+    next multiple of 16 with a zero in front: the LZMA decoder takes the position state from
+    the low bits of `pos` and the previous byte from `buf[pos - 1]`. `full` then counts from
+    there (`full_base`), across the wrap that may follow before the dictionary is full again;
+    `decode_buffer()` stops where it becomes full, to set `has_wrapped`. A new dictionary
+    starts at `LZ_DICT_INIT_POS`, as upstream's.
+  * `lzma_lz_decoder_init()` allocates at least the state's `min_size` and keeps a dictionary
+    large enough, so that the bytes in it stay; one too small, or freed with its coder
+    (`lz_decoder_end()`, when a Block's filter chain differs from the previous one), goes to
+    the state's `retire` callback instead of being freed. Preset dictionaries (raw decoders
+    only, never in `.xz`, `.lzma` or `.lz` files) are refused, and their copying is gone.
+  * `in_place_report()` updates the state's `buf`, `size` and `next` after every decoding
+    step and initialisation.
+* `common/block_decoder.c`: a Block whose filter chain is not a lone LZMA2 (the one that
+  suppresses the hook) does not decode in the dictionary, as its output is not there:
+  `lzma_lz_in_place_block()` marks it `filtered` and refuses an output buffer inside the
+  dictionary, so the caller decodes it into a buffer of its own.
 
 The Rust side (`../../src/xz.rs`) installs the hook around every `lzma_code` call with the
 running output total as `out_abs_base` and clears it afterwards.
@@ -87,8 +123,11 @@ depend on `lz-copyback` and on the genuine `liblzma-sys` at the same time:
    translation unit (`-include<path>`, or `/FI<path>` under MSVC).
 3. **The Rust bindings carry `#[link_name = "lzcb_..."]`**, so the Rust-visible API keeps
    upstream's names.
+4. **The archive is `liblzcb_lzma.a`**, not `liblzma.a`. Its directory goes on the search path of the
+   final link, where a `liblzma.a` would be taken for the `-llzma` of a crate linking the system
+   library, whose symbols then come out undefined.
 
-`lzcb_prefix.h` is generated: `tools/gen-symbol-prefix.sh lzma-sys liblzma.a` builds the
+`lzcb_prefix.h` is generated: `tools/gen-symbol-prefix.sh lzma-sys liblzcb_lzma.a` builds the
 archive with `LZCB_NO_PREFIX=1`, reads its symbol table and writes the header.
 `tests/symbols.rs` re-reads the built archive and fails, naming the offenders, if any global
 definition lost its prefix.
@@ -108,7 +147,7 @@ through `TUKLIB_SYMBOL()`, which blocks macro expansion. `build.rs` uses upstrea
    upstream versions and apply upstream's diff to the patched ones (that is how 0.4.7 became
    0.4.9).
 2. `git apply -p1 ggcat-lz-hook.patch` from the crate directory and resolve any conflicts.
-3. `tools/gen-symbol-prefix.sh lzma-sys liblzma.a` -- the symbol list is not stable across
+3. `tools/gen-symbol-prefix.sh lzma-sys liblzcb_lzma.a` -- the symbol list is not stable across
    versions.
 4. `python3 tools/add-link-names.py external/lzma-sys/src/bindgen.rs` if the bindings were
    regenerated.

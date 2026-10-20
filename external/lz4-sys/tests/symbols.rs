@@ -11,5 +11,5 @@ mod common;
 
 #[test]
 fn every_exported_symbol_is_prefixed() {
-    common::assert_all_prefixed("liblz4.a");
+    common::assert_all_prefixed("liblzcb_lz4.a");
 }

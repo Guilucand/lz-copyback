@@ -1,13 +1,13 @@
 [package]
 name = "lz-copyback"
-version = "2.0.0"
+version = "3.0.0"
 authors = ["Andrea Cracco <guilucand@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
 readme = "README.md"
 keywords = ["compression", "lz77", "decompression", "xz", "zstd"]
 categories = ["compression"]
-description = "xz, zstd, lz4 and gzip decoders that report the LZ matches they decode"
+description = "xz, zstd, lz4 and gzip decoders that decode in place and report the LZ matches they decode"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/algbio/ggcat"
 
@@ -17,11 +17,13 @@ doctest = false
 
 [dependencies]
 # Patched C libraries, vendored under external/ (see their PATCH.md).
-lzcb-lzma-sys = { path = "external/lzma-sys", version = "0.2.0" }
-lzcb-zstd-sys = { path = "external/zstd-sys", version = "0.2.0", default-features = false }
-lzcb-lz4-sys = { path = "external/lz4-sys", version = "0.1.0" }
+lzcb-lzma-sys = { path = "external/lzma-sys", version = "0.3.0" }
+lzcb-zstd-sys = { path = "external/zstd-sys", version = "0.3.0", default-features = false }
+lzcb-lz4-sys = { path = "external/lz4-sys", version = "0.1.1" }
 # Already has the match hook (`DeflateOutput::on_lz_copy`).
 streaming-libdeflate-rs = "0.3.0"
+# The gzip member checksum, computed by the in-place decoder on its own output.
+crc32fast = "1.4"
 
 [dev-dependencies]
 rand = "0.8.5"
@@ -29,7 +31,7 @@ rand = "0.8.5"
 # binary links them next to the prefixed forks, which is the coexistence check: if a C
 # symbol lost its prefix, the link fails.
 flate2 = "1.1"
-liblzma = { version = "0.4.9", features = ["static"] }
+liblzma = { version = "0.4.9", features = ["static", "parallel"] }
 zstd = "0.13.3"
 lz4 = "1.28.1"
 

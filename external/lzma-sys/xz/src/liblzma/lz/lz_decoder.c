@@ -59,6 +59,42 @@ lzma_lz_suppress_match_hook(bool suppress)
 }
 
 
+// ggcat in-place decoding: the calling thread's state, NULL while it is off.
+// See lzma_lz_in_place in lz_decoder.h.
+static LZMA_LZ_TLS lzma_lz_in_place *lz_in_place_tls = NULL;
+
+
+extern void
+lzma_lz_set_in_place(lzma_lz_in_place *state)
+{
+	lz_in_place_tls = state;
+}
+
+
+extern void
+lzma_lz_in_place_free(uint8_t *buf)
+{
+	lzma_free(buf, NULL);
+}
+
+
+extern bool
+lzma_lz_in_place_block(bool filtered, const uint8_t *out)
+{
+	lzma_lz_in_place *state = lz_in_place_tls;
+	if (state == NULL)
+		return false;
+
+	state->filtered = filtered;
+	if (!filtered || state->buf == NULL)
+		return false;
+
+	const uintptr_t at = (uintptr_t)out;
+	const uintptr_t start = (uintptr_t)state->buf;
+	return at >= start && at < start + state->size + LZ_DICT_EXTRA;
+}
+
+
 typedef struct {
 	/// Dictionary (history buffer)
 	lzma_dict dict;
@@ -90,12 +126,68 @@ typedef struct {
 } lzma_coder;
 
 
+/// ggcat in-place decoding: tell the caller where the dictionary is and where
+/// the next byte will be decoded.
+static void
+in_place_report(const lzma_coder *coder)
+{
+	lzma_lz_in_place *state = lz_in_place_tls;
+	if (state == NULL)
+		return;
+
+	state->buf = coder->dict.buf;
+	state->size = coder->dict.size;
+
+	// A full dictionary wraps before the next byte is decoded.
+	state->next = coder->dict.pos == coder->dict.size
+			? LZ_DICT_REPEAT_MAX : coder->dict.pos;
+	return;
+}
+
+
+/// Free the dictionary or, during in-place decoding, hand it to the caller,
+/// which may still be reading the bytes in it.
+static void
+dict_free(lzma_coder *coder, const lzma_allocator *allocator)
+{
+	lzma_lz_in_place *state = lz_in_place_tls;
+	if (state != NULL && state->retire != NULL && allocator == NULL
+			&& coder->dict.buf != NULL) {
+		state->retire(state->retire_ctx, coder->dict.buf,
+				coder->dict.size);
+		if (state->buf == coder->dict.buf) {
+			state->buf = NULL;
+			state->size = 0;
+		}
+	} else {
+		lzma_free(coder->dict.buf, allocator);
+	}
+
+	coder->dict.buf = NULL;
+	coder->dict.size = 0;
+	return;
+}
+
+
 static void
 lz_decoder_reset(lzma_coder *coder)
 {
-	coder->dict.pos = LZ_DICT_INIT_POS;
+	// ggcat in-place decoding: the bytes decoded so far stay where they
+	// are, for the caller to read, and the dictionary restarts right after
+	// them. The LZMA decoder takes the position state from the low bits of
+	// pos and the previous byte from buf[pos - 1], so the restart is at
+	// the next multiple of 16, with a zero in front. A full dictionary
+	// restarts at its beginning, where it would wrap anyway; a new one
+	// starts at LZ_DICT_INIT_POS, which is also its full_base.
+	size_t pos = coder->dict.pos;
+	if (pos != coder->dict.full_base)
+		pos = pos == coder->dict.size ? LZ_DICT_REPEAT_MAX
+				: (pos + 16) & ~((size_t)(15));
+
+	coder->dict.pos = pos;
+	coder->dict.full_base = pos;
+	coder->dict.buf[pos - 1] = '\0';
 	coder->dict.full = 0;
-	coder->dict.buf[LZ_DICT_INIT_POS - 1] = '\0';
 	coder->dict.has_wrapped = false;
 	coder->dict.need_reset = false;
 	return;
@@ -113,16 +205,39 @@ decode_buffer(lzma_coder *coder,
 		if (coder->dict.pos == coder->dict.size) {
 			// See the comment of #define LZ_DICT_REPEAT_MAX.
 			coder->dict.pos = LZ_DICT_REPEAT_MAX;
-			coder->dict.has_wrapped = true;
 			memcpy(coder->dict.buf, coder->dict.buf
 						+ coder->dict.size
 						- LZ_DICT_REPEAT_MAX,
 					LZ_DICT_REPEAT_MAX);
+
+			// ggcat in-place decoding: after a reset that left the
+			// decoded bytes in place, the dictionary is not full
+			// yet when it wraps, and goes on filling up past it.
+			if (!coder->dict.has_wrapped) {
+				const size_t full = coder->dict.size
+						- coder->dict.full_base;
+				if (full < coder->dict.size
+						- 2 * LZ_DICT_REPEAT_MAX)
+					coder->dict.full_base
+						= LZ_DICT_REPEAT_MAX - full;
+				else
+					coder->dict.has_wrapped = true;
+			}
 		}
 
 		// Store the current dictionary position. It is needed to know
 		// where to start copying to the out[] buffer.
 		const size_t dict_start = coder->dict.pos;
+
+		// ggcat in-place decoding: decode only straight into the
+		// caller's buffer, which is the dictionary at dict_start. If it
+		// is not (the position moved), let the caller call again with
+		// the right one. The output of a filtered block goes to the
+		// filter, through its buffer, copied as upstream does.
+		const bool in_place = !lz_hook_tls.suppressed;
+		if (in_place && (uintptr_t)out + *out_pos
+				!= (uintptr_t)(coder->dict.buf + dict_start))
+			return LZMA_OK;
 
 		// Calculate how much we allow coder->lz.code() to decode.
 		// It must not decode past the end of the dictionary
@@ -131,6 +246,18 @@ decode_buffer(lzma_coder *coder,
 		coder->dict.limit = coder->dict.pos
 				+ my_min(out_size - *out_pos,
 					coder->dict.size - coder->dict.pos);
+
+		// ggcat in-place decoding: stop where the dictionary becomes
+		// full (before its end after a reset in place), to mark it so.
+		// Wrapping arithmetic: full_base can be "negative".
+		if (!coder->dict.has_wrapped) {
+			const size_t full_end = coder->dict.full_base
+					+ (coder->dict.size
+						- 2 * LZ_DICT_REPEAT_MAX);
+			if (full_end - dict_start
+					< coder->dict.limit - dict_start)
+				coder->dict.limit = full_end;
+		}
 
 		// ggcat LZ hook: dict.buf[dict_start..dict.pos] is copied to
 		// out[*out_pos..] right after this call, so a dictionary byte at
@@ -149,15 +276,21 @@ decode_buffer(lzma_coder *coder,
 				coder->lz.coder, &coder->dict,
 				in, in_pos, in_size);
 
+		if (!coder->dict.has_wrapped && coder->dict.pos
+				- coder->dict.full_base >= coder->dict.size
+					- 2 * LZ_DICT_REPEAT_MAX)
+			coder->dict.has_wrapped = true;
+
 		// Copy the decoded data from the dictionary to the out[]
 		// buffer. Do it conditionally because out can be NULL
 		// (in which case copy_size is always 0). Calling memcpy()
 		// with a null-pointer is undefined even if the third
-		// argument is 0.
+		// argument is 0. Decoding in place, the bytes are there
+		// already: only a filtered block's are copied.
 		const size_t copy_size = coder->dict.pos - dict_start;
 		assert(copy_size <= out_size - *out_pos);
 
-		if (copy_size > 0)
+		if (copy_size > 0 && !in_place)
 			memcpy(out + *out_pos, coder->dict.buf + dict_start,
 					copy_size);
 
@@ -198,9 +331,12 @@ lz_decode(void *coder_ptr, const lzma_allocator *allocator,
 {
 	lzma_coder *coder = coder_ptr;
 
-	if (coder->next.code == NULL)
-		return decode_buffer(coder, in, in_pos, in_size,
+	if (coder->next.code == NULL) {
+		const lzma_ret ret = decode_buffer(coder, in, in_pos, in_size,
 				out, out_pos, out_size);
+		in_place_report(coder);
+		return ret;
+	}
 
 	// We aren't the last coder in the chain, we need to decode
 	// our input to a temporary buffer.
@@ -255,7 +391,7 @@ lz_decoder_end(void *coder_ptr, const lzma_allocator *allocator)
 	lzma_coder *coder = coder_ptr;
 
 	lzma_next_end(&coder->next, allocator);
-	lzma_free(coder->dict.buf, allocator);
+	dict_free(coder, allocator);
 
 	if (coder->lz.end != NULL)
 		coder->lz.end(coder->lz.coder, allocator);
@@ -288,6 +424,8 @@ lzma_lz_decoder_init(lzma_next_coder *next, const lzma_allocator *allocator,
 
 		coder->dict.buf = NULL;
 		coder->dict.size = 0;
+		coder->dict.pos = LZ_DICT_INIT_POS;
+		coder->dict.full_base = LZ_DICT_INIT_POS;
 		coder->dict.hook = NULL;
 		coder->dict.hook_ctx = NULL;
 		coder->dict.hook_min_len = UINT32_MAX;
@@ -329,13 +467,32 @@ lzma_lz_decoder_init(lzma_next_coder *next, const lzma_allocator *allocator,
 
 	// Reserve extra space as explained in the comment
 	// of #define LZ_DICT_REPEAT_MAX.
-	const size_t alloc_size
-			= lz_options.dict_size + 2 * LZ_DICT_REPEAT_MAX;
+	size_t alloc_size = lz_options.dict_size + 2 * LZ_DICT_REPEAT_MAX;
+
+	// ggcat in-place decoding: this fork decodes in place only, with the
+	// caller's state. The dictionary is at least as large as the caller
+	// needs, and one large enough is kept, so that the bytes decoded so far
+	// stay readable; one too small is handed to the caller (dict_free()).
+	const lzma_lz_in_place *in_place = lz_in_place_tls;
+	if (in_place == NULL)
+		return LZMA_PROG_ERROR;
+
+	if (lz_options.preset_dict != NULL && lz_options.preset_dict_size > 0)
+		return LZMA_OPTIONS_ERROR;
+
+	if (in_place->min_size > SIZE_MAX - 15 - LZ_DICT_EXTRA)
+		return LZMA_MEM_ERROR;
+
+	const size_t min_size = (in_place->min_size + 15) & ~((size_t)(15));
+	if (alloc_size < min_size)
+		alloc_size = min_size;
+
+	if (coder->dict.buf != NULL && coder->dict.size >= alloc_size)
+		alloc_size = coder->dict.size;
 
 	// Allocate and initialize the dictionary.
 	if (coder->dict.size != alloc_size) {
-		coder->dict.size = 0;
-		lzma_free(coder->dict.buf, allocator);
+		dict_free(coder, allocator);
 
 		// The LZ_DICT_EXTRA bytes at the end of the buffer aren't
 		// included in alloc_size. These extra bytes allow
@@ -350,26 +507,14 @@ lzma_lz_decoder_init(lzma_next_coder *next, const lzma_allocator *allocator,
 		// coder->dict.full is updated will take care that we will
 		// still reject distances larger than lz_options.dict_size.
 		coder->dict.size = alloc_size;
+
+		// A new dictionary starts at the beginning.
+		coder->dict.pos = LZ_DICT_INIT_POS;
+		coder->dict.full_base = LZ_DICT_INIT_POS;
 	}
 
 	lz_decoder_reset(next->coder);
-
-	// Use the preset dictionary if it was given to us.
-	if (lz_options.preset_dict != NULL
-			&& lz_options.preset_dict_size > 0) {
-		// If the preset dictionary is bigger than the actual
-		// dictionary, copy only the tail.
-		const size_t copy_size = my_min(lz_options.preset_dict_size,
-				lz_options.dict_size);
-		const size_t offset = lz_options.preset_dict_size - copy_size;
-		memcpy(coder->dict.buf + coder->dict.pos,
-				lz_options.preset_dict + offset,
-				copy_size);
-
-		// dict.pos isn't zero after lz_decoder_reset().
-		coder->dict.pos += copy_size;
-		coder->dict.full = copy_size;
-	}
+	in_place_report(next->coder);
 
 	// Miscellaneous initializations
 	coder->next_finished = false;

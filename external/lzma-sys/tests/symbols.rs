@@ -8,5 +8,5 @@ mod common;
 
 #[test]
 fn every_exported_symbol_is_prefixed() {
-    common::assert_all_prefixed("liblzma.a");
+    common::assert_all_prefixed("liblzcb_lzma.a");
 }

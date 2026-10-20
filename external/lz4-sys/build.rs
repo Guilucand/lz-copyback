@@ -68,7 +68,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             compiler.flag(format!("-include{}", hdr));
         }
     }
-    compiler.compile("liblz4.a");
+    // lzcb: not liblz4.a. The archive's directory is on the final link's search path, where it
+    // would otherwise stand in for a system liblz4 that a crate links with -llz4.
+    compiler.compile("liblzcb_lz4.a");
 
     let src = env::current_dir()?.join("liblz4").join("lib");
     let dst = PathBuf::from(env::var_os("OUT_DIR").ok_or("missing OUT_DIR environment variable")?);
