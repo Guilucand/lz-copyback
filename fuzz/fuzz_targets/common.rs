@@ -124,8 +124,8 @@ const RECHECK: u64 = 256;
 /// target only at the end of the stream; the bytes decoded do not change while they are
 /// retained (the oldest and the newest of them are read again after every step); every piece
 /// is the next bytes; copybacks come no later than their bytes, in stream order, each a
-/// correct raw match of at least the shortest length.
-pub fn read_checked(decoder: &mut dyn InPlaceDecoder, reading: &Reading, limit: u64) -> Outcome {
+/// correct raw match of at least the shortest length (see [`check_copybacks`] for `sourceless`).
+pub fn read_checked(decoder: &mut dyn InPlaceDecoder, reading: &Reading, limit: u64, sourceless: bool) -> Outcome {
     let retain = reading.retain() as u64;
     let mut tracking = reading.tracking;
     decoder.set_copybacks_min_len(reading.min_len);
@@ -190,24 +190,30 @@ pub fn read_checked(decoder: &mut dyn InPlaceDecoder, reading: &Reading, limit: 
             break;
         }
     }
-    check_copybacks(&out, &copybacks, reading.min_len);
+    check_copybacks(&out, &copybacks, reading.min_len, sourceless);
     Outcome { out, copybacks, error }
 }
 
 /// The invariants of every list of raw matches: in stream order, destinations never
 /// overlapping, each at least `min_len` bytes and a correct repeat of earlier output (byte by
 /// byte, so an overlapping, periodic match is checked as it is decoded), as far as `out` goes.
-pub fn check_copybacks(out: &[u8], copybacks: &[Copyback], min_len: u32) {
+/// With `sourceless`, a match may reach before the start of the output: streaming-libdeflate-rs
+/// takes a corrupt deflate distance reaching before the stream's start, a known and accepted
+/// behaviour (it copies zeros, within its buffers), which the gzip trailer's checksum rejects.
+pub fn check_copybacks(out: &[u8], copybacks: &[Copyback], min_len: u32, sourceless: bool) {
     let mut next_free = 0;
     for copyback in copybacks {
         let (dst, off, len) = (copyback.destination, copyback.offset as u64, copyback.len as u64);
-        assert!(off > 0 && off <= dst, "{copyback:?} has no source in the output");
+        assert!(off > 0 && (sourceless || off <= dst), "{copyback:?} has no source in the output");
         assert!(len >= min_len.max(1) as u64, "{copyback:?} is shorter than {min_len}");
         assert!(dst >= next_free, "{copyback:?} overlaps the previous destination");
+        next_free = dst + len;
+        if off > dst {
+            continue;
+        }
         for i in dst..(dst + len).min(out.len() as u64) {
             assert_eq!(out[i as usize], out[(i - off) as usize], "{copyback:?} differs at {i}");
         }
-        next_free = dst + len;
     }
 }
 
@@ -327,15 +333,15 @@ impl Read for StockGzip<'_> {
 /// decoder fails and ours does not, ours must have decoded at least as much; that is a bug
 /// but for xz, whose dictionary, at least the bytes to retain, also takes corrupt matches
 /// reaching farther back than the stream's own dictionary size. gzip is also checked against
-/// flate2 (miniz_oxide), as its stock decoder is the same libdeflate as ours: on every byte
-/// both decoded, which leaves out the bytes libdeflate decodes from the zero padding after a
-/// truncated input before it fails.
+/// flate2 on zlib-rs, as its stock decoder is the same libdeflate as ours: on every byte both
+/// decoded, so up to where zlib rejects a corrupt stream (libdeflate takes a distance reaching
+/// before a member's start, a known and accepted behaviour, and fails later on its checksum).
 pub fn raw(codec: Codec, bytes: &[u8]) {
     let (head, encoded) = bytes.split_at(bytes.len().min(PARAMS));
     let reading = Reading::new(&mut Params(head));
     let limit = reading.limit();
     let Some(mut decoder) = decoder(codec, encoded, reading.retain()) else { return };
-    let ours = read_checked(&mut *decoder, &reading, limit);
+    let ours = read_checked(&mut *decoder, &reading, limit, codec == Codec::Gzip);
     drop(decoder);
     let (theirs, their_error) = stock(codec, encoded, limit);
 
@@ -412,7 +418,7 @@ pub fn data(params: &mut Params, seed: &[u8], max_len: usize) -> Vec<u8> {
 /// A round trip: `encoded` must decode, read as `reading` says, to exactly `expected`.
 pub fn round_trip(codec: Codec, encoded: &[u8], expected: &[u8], reading: &Reading) {
     let mut decoder = decoder(codec, encoded, reading.retain()).expect("a decoder");
-    let outcome = read_checked(&mut *decoder, reading, u64::MAX);
+    let outcome = read_checked(&mut *decoder, reading, u64::MAX, false);
     if let Some(error) = &outcome.error {
         panic!("{codec:?}: failed ({error}) after {} of {} bytes", outcome.out.len(), expected.len());
     }

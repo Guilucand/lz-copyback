@@ -16,7 +16,9 @@ liblzma = { version = "0.4.9", features = ["static", "parallel"] }
 # Without legacy (v0.x) frames, which the zstd fork does not decode either.
 zstd = { version = "0.13.3", default-features = false }
 lz4 = "1.28.1"
-flate2 = "1.1"
+# zlib-rs, a port of zlib: miniz_oxide (the default) takes a distance reaching before the start
+# of a member, as streaming-libdeflate-rs does, so it could not tell a wrong byte there.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 streaming-libdeflate-rs = "0.3.0"
 
 # Not part of lz-copyback's workspace.

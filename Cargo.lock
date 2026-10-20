@@ -455,9 +455,9 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streaming-libdeflate-rs"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "618cc29c4373285bdbe662cd5b60f891fe807f3797451c564b57e5e4294f3c57"
+checksum = "91a06a043f1252583d62daf4f6c160620d30e1a80159dc1eb5338653bbe84774"
 dependencies = [
  "crc32fast",
  "filebuffer",

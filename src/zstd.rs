@@ -224,8 +224,8 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
 
         // A block needs room for the largest one; the other steps write nothing.
         let is_block = kind == ffi::ZSTDnit_block || kind == ffi::ZSTDnit_lastBlock;
+        let room = self.block_max + BLOCK_SLACK;
         if is_block {
-            let room = self.block_max + BLOCK_SLACK;
             if self.write + room > self.ring_len {
                 self.write = 0;
             }
@@ -241,10 +241,15 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
             let ctx = self.copybacks.hook_ctx();
             unsafe { ffi::ZSTD_DCtx_setLzMatchHook(dctx, Some(copyback_hook), ctx, min_len) };
         }
-        let (dst, capacity) = if self.ring_len > 0 {
-            (unsafe { self.ring.as_ptr().add(self.write) }, self.ring_len - self.write)
+        let dst = if self.ring_len > 0 { unsafe { self.ring.as_ptr().add(self.write) } } else { ptr::null_mut() };
+        let capacity = if is_block {
+            // zstd checks the size of a decoded block only after writing it, up to the capacity
+            // it is given: a corrupt block is kept to its room. Nor does a frame decode past the
+            // content size its header declares, as zstd's one-shot decoding does not.
+            let left = self.content_size.map_or(u64::MAX, |size| size.saturating_sub(self.frame_decoded));
+            (room as u64).min(left) as usize
         } else {
-            (ptr::null_mut(), 0)
+            self.ring_len - self.write
         };
         let decoded = unsafe {
             ffi::ZSTD_decompressContinue(

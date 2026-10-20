@@ -131,3 +131,57 @@ fn gzip_bytes_decoded_before_an_error_are_readable() {
     let data = data();
     check_bytes_before_the_error(Codec::Gzip, &common::gzip_encode(&data, 6), &data);
 }
+
+/// A zstd frame that declares its content size fails as its blocks go past it, without
+/// decoding a byte past it, as zstd's own decoders do (found by fuzzing).
+#[test]
+fn zstd_frame_longer_than_its_content_size_is_an_error() {
+    // A frame declaring 357 bytes (a 2 MiB window), an RLE block of 1000 bytes, then an empty
+    // last block: zstd checks the content size within the call only for a last block.
+    let mut encoded = vec![0x28, 0xb5, 0x2f, 0xfd, 0x40, 0x58, 0x65, 0x00];
+    encoded.extend(&(1u32 << 1 | 1000 << 3).to_le_bytes()[..3]);
+    encoded.push(b'A');
+    encoded.extend([1, 0, 0]);
+    let mut stock = zstd::stream::read::Decoder::new(&encoded[..]).unwrap();
+    assert!(stock.read(&mut vec![0; 1 << 16]).is_err());
+    let mut decoder = decoder(Codec::Zstd, &encoded, 1 << 20);
+    assert!(decoder.decode_to(u64::MAX).is_err());
+    assert!(decoder.decoded_len() <= 357, "decoded {} bytes", decoder.decoded_len());
+}
+
+/// zstd checks the size of a decoded block only after writing it: a corrupt block larger than
+/// the frame's largest must not be written over the retained bytes before the error.
+#[test]
+fn zstd_oversized_block_keeps_the_retained_bytes() {
+    let retain = 4096;
+    for blocks in 1..16 {
+        for rle in (1100..8000).step_by(300) {
+            // No content size, a 1 KiB window and so blocks of at most 1 KiB: raw blocks of
+            // 1 KiB, then a last RLE block of `rle` bytes.
+            let data = common::random_bytes(blocks as u64, blocks * 1024);
+            let mut encoded = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00];
+            for block in data.chunks(1024) {
+                encoded.extend(&(1024u32 << 3).to_le_bytes()[..3]);
+                encoded.extend(block);
+            }
+            encoded.extend(&(1u32 | 1 << 1 | (rle as u32) << 3).to_le_bytes()[..3]);
+            encoded.push(b'A');
+
+            let mut decoder = decoder(Codec::Zstd, &encoded, retain);
+            let mut target = 0;
+            let error = loop {
+                target += 1024;
+                if let Err(error) = decoder.decode_to(target) {
+                    break error;
+                }
+            };
+            let _ = error;
+            let (oldest, decoded) = (target.saturating_sub(retain as u64), decoder.decoded_len());
+            let bytes: Vec<u8> = decoder.bytes(oldest..decoded).flatten().copied().collect();
+            assert!(
+                bytes == data[oldest as usize..decoded as usize],
+                "{blocks} blocks, RLE of {rle}: the retained bytes {oldest}..{decoded} changed"
+            );
+        }
+    }
+}

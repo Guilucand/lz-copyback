@@ -21,7 +21,7 @@ lzcb-lzma-sys = { path = "external/lzma-sys", version = "0.3.0" }
 lzcb-zstd-sys = { path = "external/zstd-sys", version = "0.3.0", default-features = false }
 lzcb-lz4-sys = { path = "external/lz4-sys", version = "0.1.1" }
 # Already has the match hook (`DeflateOutput::on_lz_copy`).
-streaming-libdeflate-rs = "0.3.0"
+streaming-libdeflate-rs = "0.3.1"
 # The gzip member checksum, computed by the in-place decoder on its own output.
 crc32fast = "1.4"
 
