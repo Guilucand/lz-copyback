@@ -1,0 +1,35 @@
+# Vendored copy of lz4-sys 1.11.1+lz4-1.10.0 with the ggcat LZ match hook (see PATCH.md).
+
+[package]
+name = "lzcb-lz4-sys"
+version = "0.1.0+lz4-1.10.0"
+authors = [
+    "Jens Heyens <jens.heyens@ewetel.net>",
+    "Artem V. Navrotskiy <bozaro@buzzsoft.ru>",
+    "Patrick Marks <pmarks@gmail.com>",
+]
+edition = "2015"
+build = "build.rs"
+links = "lzcb_lz4"
+description = "Fork of lz4-sys 1.11.1 (liblz4 1.10.0) whose frame decoder reports every LZ match through a hook and whose C symbols are prefixed, for the lz-copyback crate."
+license = "MIT"
+repository = "https://github.com/algbio/ggcat"
+# upstream: "https://github.com/10xGenomics/lz4-rs"
+
+[lib]
+name = "lzcb_lz4_sys"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies.libc]
+version = "0.2"
+
+[build-dependencies.cc]
+version = "1.1"
+
+[[test]]
+name = "symbols"
+path = "tests/symbols.rs"
+
+[dev-dependencies.object]
+version = "0.37"

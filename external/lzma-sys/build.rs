@@ -11,6 +11,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LZMA_API_STATIC");
     println!("cargo:rerun-if-changed=xz/src/liblzma/lz/lz_decoder.c");
     println!("cargo:rerun-if-changed=xz/src/liblzma/lz/lz_decoder.h");
+    println!("cargo:rerun-if-changed=xz/src/liblzma/lzma/lzma_decoder.c");
+    println!("cargo:rerun-if-changed=xz/src/liblzma/common/block_decoder.c");
     // lzcb: this fork carries the LZ match hook, so the bundled source is always
     // built; a system liblzma would lack lzma_lz_set_match_hook. Upstream's
     // pkg-config probe is deliberately gone.

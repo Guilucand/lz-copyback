@@ -2,9 +2,9 @@
 # Regenerate external/<crate>/ggcat-lz-hook.patch: the diff of the fork against the
 # pristine upstream crate, applyable with `git apply -p1` from the fork directory.
 #
-#   ./tools/gen-patch.sh lzma-sys liblzma-sys-0.4.7
-#   ./tools/gen-patch.sh zstd-sys 'zstd-sys-2.0.16+zstd.1.5.7'
-#   ./tools/gen-patch.sh lz4-flex lz4_flex-0.11.6
+#   ./tools/gen-patch.sh lzma-sys liblzma-sys-0.4.9
+#   ./tools/gen-patch.sh zstd-sys 'zstd-sys-2.1.2+zstd.1.5.7'
+#   ./tools/gen-patch.sh lz4-sys 'lz4-sys-1.11.1+lz4-1.10.0'
 #
 # Only files present in the fork are diffed. Pruning (whole directories dropped from the
 # upstream tree) is documented in PATCH.md instead, so it does not bury the real change

@@ -139,11 +139,14 @@ struct ZSTD_DCtx_s
     ZSTD_FrameHeader fParams;
     U64 processedCSize;
     U64 decodedSize;
-    /* ggcat LZ hook: decoded bytes across all frames (never reset) and the
-     * match callback installed with ZSTD_DCtx_setLzMatchHook(). */
+    /* ggcat LZ hook: decoded bytes across all frames (never reset), the
+     * match callback installed with ZSTD_DCtx_setLzMatchHook(), and the
+     * shortest match it gets (SIZE_MAX without a callback, so that
+     * ZSTD_LZ_HOOK needs a single comparison). */
     U64 lzTotalOut;
     void (*lzHook)(void* ctx, unsigned long long dstAbs, unsigned distance, unsigned matchLength);
     void* lzHookCtx;
+    size_t lzHookMinLen;
     blockType_e bType;            /* used in ZSTD_decompressContinue(), store blockType between block header decoding and block decompression stages */
     ZSTD_dStage stage;
     U32 litEntropy;
@@ -243,11 +246,12 @@ void ZSTD_checkContinuity(ZSTD_DCtx* dctx, const void* dst, size_t dstSize);
 
 
 
-/* ggcat LZ hook: report one sequence right before it is executed. `op` is the
- * block output cursor, `ostart` the block start; the match destination is
+/* ggcat LZ hook: report one sequence's match, with its full length, right after
+ * the sequence is executed and before the output cursor moves past it. `op` is
+ * the block output cursor, `ostart` the block start; the match destination is
  * lzTotalOut + (op - ostart) + litLength and `offset` is the resolved distance. */
 #define ZSTD_LZ_HOOK(dctx, ostart, op, seq) do { \
-    if ((dctx)->lzHook != NULL) \
+    if ((seq).matchLength >= (dctx)->lzHookMinLen) \
         (dctx)->lzHook((dctx)->lzHookCtx, \
             (unsigned long long)(dctx)->lzTotalOut + (unsigned long long)((op) - (ostart)) + (unsigned long long)(seq).litLength, \
             (unsigned)(seq).offset, (unsigned)(seq).matchLength); \
@@ -255,7 +259,7 @@ void ZSTD_checkContinuity(ZSTD_DCtx* dctx, const void* dst, size_t dstSize);
 
 ZSTDLIB_API void ZSTD_DCtx_setLzMatchHook(ZSTD_DCtx* dctx,
         void (*hook)(void* ctx, unsigned long long dstAbs, unsigned distance, unsigned matchLength),
-        void* ctx);
+        void* ctx, unsigned minLength);
 ZSTDLIB_API unsigned long long ZSTD_DCtx_getLzTotalOut(const ZSTD_DCtx* dctx);
 
 #endif /* ZSTD_DECOMPRESS_INTERNAL_H */

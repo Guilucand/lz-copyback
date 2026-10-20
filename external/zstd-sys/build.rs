@@ -44,8 +44,19 @@ fn compile_zstd() {
     }
 
     // Either include ASM files, or disable ASM entirely.
+    //
+    // The only assembly zstd ships is huf_decompress_amd64.S, which upstream
+    // gates on __x86_64__ in portability_macros.h. Anywhere else it can only
+    // ever preprocess to an empty object, while still costing an assembler
+    // invocation.
+    //
     // Also disable it on windows, apparently it doesn't do well with these .S files at the moment.
-    if cfg!(feature = "no_asm") || std::env::var("CARGO_CFG_WINDOWS").is_ok() {
+    let target_arch =
+        std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if cfg!(feature = "no_asm")
+        || target_arch != "x86_64"
+        || std::env::var("CARGO_CFG_WINDOWS").is_ok()
+    {
         config.define("ZSTD_DISABLE_ASM", Some(""));
     } else {
         config.file("zstd/lib/decompress/huf_decompress_amd64.S");
@@ -123,7 +134,9 @@ fn compile_zstd() {
     // Hide symbols from resulting library,
     // so we can be used with another zstd-linking lib.
     // See https://github.com/gyscos/zstd-rs/issues/58
-    config.flag("-fvisibility=hidden");
+    if !target_is_msvc() {
+        config.flag("-fvisibility=hidden");
+    }
     config.define("XXH_PRIVATE_API", Some(""));
     config.define("ZSTDLIB_VISIBILITY", Some(""));
     config.define("ZSTDERRORLIB_VISIBILITY", Some(""));
@@ -150,6 +163,11 @@ fn compile_zstd() {
     fs::copy(src.join("zstd_errors.h"), include.join("zstd_errors.h"))
         .unwrap();
     cargo_print(&format_args!("root={}", dst.display()));
+}
+
+/// Is the *target* toolchain MSVC? `cfg!(target_env = ..)` would answer for the host.
+fn target_is_msvc() -> bool {
+    env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() == "msvc"
 }
 
 /// Print a line for cargo.

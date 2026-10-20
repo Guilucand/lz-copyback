@@ -32,18 +32,30 @@ typedef struct {
 	lzma_lz_match_hook hook;
 	void *ctx;
 	uint64_t out_abs_base;
+	uint32_t min_len;
+	bool suppressed;
 } lzma_lz_hook_state;
 
-static LZMA_LZ_TLS lzma_lz_hook_state lz_hook_tls = { NULL, NULL, 0 };
+static LZMA_LZ_TLS lzma_lz_hook_state lz_hook_tls = { NULL, NULL, 0, 0, false };
 
 
 extern void
 lzma_lz_set_match_hook(lzma_lz_match_hook hook, void *ctx,
-		uint64_t out_abs_base)
+		uint64_t out_abs_base, uint32_t min_len)
 {
 	lz_hook_tls.hook = hook;
 	lz_hook_tls.ctx = ctx;
 	lz_hook_tls.out_abs_base = out_abs_base;
+	lz_hook_tls.min_len = min_len;
+}
+
+
+extern bool
+lzma_lz_suppress_match_hook(bool suppress)
+{
+	const bool previous = lz_hook_tls.suppressed;
+	lz_hook_tls.suppressed = suppress;
+	return previous;
 }
 
 
@@ -123,8 +135,12 @@ decode_buffer(lzma_coder *coder,
 		// ggcat LZ hook: dict.buf[dict_start..dict.pos] is copied to
 		// out[*out_pos..] right after this call, so a dictionary byte at
 		// index p lands at out_abs_base + *out_pos + (p - dict_start).
-		coder->dict.hook = lz_hook_tls.hook;
+		const bool hooked = lz_hook_tls.hook != NULL
+				&& !lz_hook_tls.suppressed;
+		coder->dict.hook = hooked ? lz_hook_tls.hook : NULL;
 		coder->dict.hook_ctx = lz_hook_tls.ctx;
+		coder->dict.hook_min_len = hooked
+				? lz_hook_tls.min_len : UINT32_MAX;
 		coder->dict.abs_base = lz_hook_tls.out_abs_base
 				+ (uint64_t)(*out_pos) - (uint64_t)dict_start;
 
@@ -274,6 +290,7 @@ lzma_lz_decoder_init(lzma_next_coder *next, const lzma_allocator *allocator,
 		coder->dict.size = 0;
 		coder->dict.hook = NULL;
 		coder->dict.hook_ctx = NULL;
+		coder->dict.hook_min_len = UINT32_MAX;
 		coder->dict.abs_base = 0;
 		coder->lz = LZMA_LZ_DECODER_INIT;
 		coder->next = LZMA_NEXT_CODER_INIT;
@@ -317,6 +334,7 @@ lzma_lz_decoder_init(lzma_next_coder *next, const lzma_allocator *allocator,
 
 	// Allocate and initialize the dictionary.
 	if (coder->dict.size != alloc_size) {
+		coder->dict.size = 0;
 		lzma_free(coder->dict.buf, allocator);
 
 		// The LZ_DICT_EXTRA bytes at the end of the buffer aren't

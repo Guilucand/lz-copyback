@@ -78,10 +78,10 @@
 #define LZ_DICT_INIT_POS (2 * LZ_DICT_REPEAT_MAX)
 
 
-/// ggcat LZ hook: called by dict_repeat() for every executed match with the
-/// absolute offset of its destination in the decoded stream, the real distance
-/// and the number of bytes copied by this call (a match split at the dictionary
-/// limit reports each part).
+/// ggcat LZ hook: called once for every match, when the decoder has decoded
+/// it, with the absolute offset of its destination in the decoded stream, the
+/// real distance and the full match length. The copy itself may then be done
+/// in several parts (see dict_report_match()); the parts are not reported.
 typedef void (*lzma_lz_match_hook)(void *ctx, uint64_t dst_abs,
 		uint32_t distance, uint32_t len);
 
@@ -120,6 +120,10 @@ typedef struct {
 	lzma_lz_match_hook hook;
 	void *hook_ctx;
 
+	/// Matches shorter than this are not reported. UINT32_MAX while there
+	/// is no hook, so that dict_report_match() needs a single comparison.
+	uint32_t hook_min_len;
+
 	/// abs_base + pos is the absolute offset of buf[pos] in the decoded
 	/// stream. Valid only inside one call of lzma_lz_decoder.code().
 	uint64_t abs_base;
@@ -130,9 +134,15 @@ typedef struct {
 /// Install the LZ match hook for the calling thread. The hook is read at the
 /// start of every decoding step, so it must be set before each lzma_code()
 /// call whose matches are of interest and cleared afterwards. out_abs_base is
-/// the absolute stream offset of the first byte that lzma_code() call writes.
+/// the absolute stream offset of the first byte that lzma_code() call writes;
+/// matches shorter than min_len bytes are not reported.
 extern void lzma_lz_set_match_hook(lzma_lz_match_hook hook, void *ctx,
-		uint64_t out_abs_base);
+		uint64_t out_abs_base, uint32_t min_len);
+
+/// Suppress (true) or allow again (false) the calling thread's LZ match hook,
+/// returning the previous setting. The block decoder suppresses it while it
+/// decodes a block whose LZ output is transformed again by another filter.
+extern bool lzma_lz_suppress_match_hook(bool suppress);
 
 
 typedef struct {
@@ -223,6 +233,23 @@ dict_is_distance_valid(const lzma_dict *const dict, const size_t distance)
 }
 
 
+/// ggcat LZ hook: report a match of len bytes at distance (as stored by the
+/// decoder, so the real distance is distance + 1) whose destination is the
+/// next byte to be written. Called once per match, before dict_repeat() or
+/// dict_put() copies it: dict_repeat() stops at the write limit (the caller's
+/// output space) and the decoder resumes the copy later, so reporting there
+/// would split the match. abs_base + pos is the absolute offset of the next
+/// output byte even when the dictionary is full and the copy is resumed in a
+/// later call.
+static inline void
+dict_report_match(const lzma_dict *dict, uint32_t distance, uint32_t len)
+{
+	if (len >= dict->hook_min_len)
+		dict->hook(dict->hook_ctx, dict->abs_base + dict->pos,
+				distance + 1, len);
+}
+
+
 /// Repeat *len bytes at distance.
 static inline bool
 dict_repeat(lzma_dict *restrict dict,
@@ -232,10 +259,6 @@ dict_repeat(lzma_dict *restrict dict,
 	const size_t dict_avail = dict->limit - dict->pos;
 	uint32_t left = my_min(dict_avail, *len);
 	*len -= left;
-
-	if (dict->hook != NULL && left != 0)
-		dict->hook(dict->hook_ctx, dict->abs_base + dict->pos,
-				distance + 1, left);
 
 	size_t back = dict->pos - distance - 1;
 	if (distance >= dict->pos)

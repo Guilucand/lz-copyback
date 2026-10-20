@@ -1,137 +1,129 @@
 # lz-copyback
 
-Streaming decompression that reports the LZ77 copies the decoder executes, so a consumer
-can tell which byte ranges of the output are verbatim repeats of earlier ranges.
+Decoders for the LZ formats ggcat reads (xz, zstd, lz4, gzip) that also report the LZ
+matches ("copybacks") they decode: which output bytes are verbatim repeats of earlier output.
+Each has the interface of the library decoder ggcat used for that format, so switching is
+mostly a matter of `use` lines.
+
+| codec | decoder | interface of | runs on |
+|---|---|---|---|
+| xz (`.xz`, `.lzma`, `.lz`) | `xz::XzDecoder` | `liblzma::read::XzDecoder` | `external/lzma-sys`: liblzma-sys 0.4.9 (XZ 5.8.4), patched |
+| zstd | `zstd::ZstdDecoder` | `zstd::stream::read::Decoder` | `external/zstd-sys`: zstd-sys 2.1.2 (zstd 1.5.7), patched |
+| lz4 | `lz4::Lz4Decoder` | `lz4::Decoder` | `external/lz4-sys`: lz4-sys 1.11.1 (liblz4 1.10.0), patched |
+| gzip | `gzip::GzipFileDecompressor`, `gzip::GzipPushDecompressor` | `LibdeflateGzipFileDecompressor`, `LibdeflateGzipPushDecompressor` | `streaming-libdeflate-rs` 0.3.0, unpatched |
+
+`gzip::GzipDecoder` adds a `Read` over the push decompressor. Codecs without an LZ stage
+(bzip2, plain files) are out of scope.
+
+| decoder | methods besides the copyback ones |
+|---|---|
+| `XzDecoder` | `new`, `new_multi_decoder`, `get_ref`, `get_mut`, `into_inner`, `total_in`, `total_out`, `Read` |
+| `ZstdDecoder` | `new`, `with_buffer`, `single_frame`, `window_log_max`, `recommended_output_size`, `get_ref`, `get_mut`, `finish`, `Read` |
+| `Lz4Decoder` | `new`, `reader`, `finish`, `Read` |
+| `GzipFileDecompressor` | `new`, `try_new`, `decompress`, `pending_output`, `consume_output`, `increase_buffer_size` |
+| `GzipPushDecompressor` | the same, plus `push_input`, `input_space_mut`, `commit_input`, `finish_input`, `push`, `finish` |
+| `GzipDecoder` | `new`, `with_buffer_size`, `get_ref`, `into_inner`, `Read` |
+
+## Copybacks
+
+Every decoder has the same three extra methods:
 
 ```rust
-use lz_copyback::{open, Direction, TrackerConfig, tar::{TarConfig, TarTracker}};
+decoder.set_copybacks_tracking(true);      // on at construction; off ignores further matches
+decoder.set_copybacks_min_len(62);         // 1 at construction: every match is recorded
+let queue: &mut VecDeque<Copyback> = decoder.peek_copybacks();
+```
 
-let mut dec = open(path, TrackerConfig::default())?;      // gz, xz, zst, lz4, bz2, plain
-let mut tar = TarTracker::new(TarConfig::default());        // only for *.tar[.xz] inputs
-while let Some(w) = dec.next_window()? {
-    // w.data: W bytes of output starting at w.start_abs (fewer on the last window)
-    // w.copies: LzCopy { src, dst, len }; the bytes at dst repeat the bytes at src
-    // w.lookahead: the already decoded bytes after w.data (destinations fall inside it)
-    let tw = tar.process(&w)?;                              // MemberCopy pieces + member spans
-    if w.is_last { break; }
+```rust
+pub struct Copyback {
+    pub destination: u64, // absolute offset of the first byte the match writes
+    pub offset: u32,      // the match copies from destination - offset on (Copyback::source)
+    pub len: u32,         // bytes written
 }
 ```
 
-## The three directions
+```rust
+use lz_copyback::xz::XzDecoder;
+use std::io::Read;
 
-A window always carries its `W` bytes of output; the `Direction` picks which end of a copy
-attaches it to that window.
+let mut decoder = XzDecoder::new_multi_decoder(file);
+decoder.set_copybacks_min_len(62);
+let mut buffer = vec![0; 1 << 20];
+while decoder.read(&mut buffer)? > 0 {
+    while let Some(copyback) = decoder.peek_copybacks().pop_front() {
+        // copyback.len bytes at copyback.destination repeat those at copyback.source().
+    }
+}
+```
 
-* **Forward** (`Direction::Forward`, the default) -- the copies whose *source* lies in the
-  window, sorted by `(src, dst)`: "these bytes come back later". A copy can only be
-  reported while its source is still inside the window, so copies farther than `W` are
-  counted as `dropped_late` and lost.
-* **Backward** (`Direction::Backward`) -- the copies whose *destination* lies in the
-  window, sorted by `(dst, src)`: "these bytes repeat something earlier". The source is
-  already decoded when the copy becomes known, so nothing is held back and no copy is lost
-  whatever its distance; the consumer needs the older bytes, or just their offsets, to use
-  it. `TarConfig::retain_back` keeps the member table alive that far back, so that a
-  copy's source member can still be named.
-* **Both** (`Direction::Both`) -- both at once: `w.copies` is the forward list and
-  `w.back_copies` the backward one, so a copy is reported twice, at each end. The two
-  lists are split at different window boundaries, so the two reports of one copy are
-  generally not the same range; match them by interval, not by equality. Copies farther
-  than `W` are still missing from the forward list (`dropped_late` counts them) while the
-  backward list has them. Use `w.src_copies()` / `w.dst_copies()` to stay
-  direction-agnostic.
+The decoder only ever pushes to the back of the queue; removing entries is up to the caller.
 
-Everything else is shared: the same decoders, the same merging and filtering, the same tar
-layer.
+* **Raw matches.** Every match exactly as the decoder decoded it: never merged with the next
+  one, never clipped, never split. A long repeat is as many matches as the compressor
+  wrote (deflate stops at 258 bytes, LZMA at 273), and a match may overlap its own output
+  (`len > offset`, a periodic repeat). `set_copybacks_min_len` filters on this raw length.
+* **Absolute destinations,** counted from the first byte the decoder produced, across
+  concatenated xz streams, zstd frames and gzip members.
+* **No later than the bytes.** A copyback is in the queue by the time the call that returns
+  its first destination byte returns:
+
+  | codec | when a match is pushed |
+  |---|---|
+  | gzip | while `decompress` decodes it, before its bytes are in `pending_output` |
+  | xz | in the `read` call that returns its first byte; a match cut by the end of the caller's buffer is still reported once, whole |
+  | zstd | when its block (at most 128 KiB) is decoded, possibly some `read` calls before its bytes |
+  | lz4 | when its block (64 KiB to 4 MiB, as the frame says) is decoded, possibly some `read` calls before its bytes |
+
+* **xz filters.** A Block whose filter chain is not a lone LZMA2 (BCJ, delta) reports
+  nothing: those filters rewrite the LZ output, so its matches do not repeat output bytes.
+  Such chains are only written on request (`xz --x86`, `--delta`, `--filters=`), never for
+  sequence data.
+* **lz4 frames.** Like upstream, `Lz4Decoder` stops after the first frame.
 
 ## How it works
 
-* `W` is the stream's maximum copy distance (32 KiB for deflate, the LZMA2 dictionary size
-  for xz, the frame window for zstd, 64 KiB for lz4) clamped into
-  `[min_window, max_window]` (defaults 1 MiB and 64 MiB).
-* Raw matches are merged when contiguous with the same distance (compressors split long
-  repeats into 258/273-byte matches), clipped to their distance when they overlap their
-  own source (`SelfOverlap::Clip`, or `Drop`), then filtered by `min_len`.
-* A window's copies come out ordered. The destination-keyed list is built in order --
-  backends report matches in destination order, destinations never overlap, and a copy cut
-  at the window boundary leaves its tail exactly there -- so it is only checked, in debug
-  builds. The source-keyed list is not: sources jump around, so it is radix sorted in place
-  on the source with `voracious_radix_sort` and the runs that share a source are then
-  ordered by destination (`src/sort.rs`), which together is exactly what sorting by
-  `(src, dst)` gives. That is about twice as fast as the standard sort on window-sized
-  lists, which `cargo run --release --example sortbench` measures.
-* `set_tracking(false)` disables the hooks at zero cost for a later dynamic cut-off.
-* Backends live in `src/backends`: deflate writes straight into the window through the
-  `on_lz_copy` hook of `streaming-libdeflate-rs`; xz, zstd and lz4 use the patched
-  vendored forks under `external/` (see their `PATCH.md`); bzip2 and plain files pass
-  through without copies.
-* The decoder alternates between two buffers of `W + slack` bytes (plus a 32 KiB history
-  guard for deflate), so no output byte is moved twice; the cost of tracking off is the
-  cold window memory, the cost of tracking on is 1-3 ns per raw match event.
-* A copy is 16 bytes and a member piece 20: only the source is absolute, the destination
-  is its distance from it, and distances, offsets and lengths are `u32`. No LZ match can
-  reach past its dictionary, whose size is a `u32` field in every format here, and a
-  length is clipped to its distance before a copy is emitted; a tar member of 4 GiB or
-  more is the one thing this rules out, and its pieces are dropped and counted rather
-  than truncated. Everything is still read in absolute `u64` coordinates.
-* The `tar` module maps copies onto archive members, splitting a copy at every member
-  boundary on both sides and dropping the pieces that touch headers, padding or opaque
-  members. Each end of a copy is located through its own cursor into the live member
-  table: the end the window is sorted by walks forward and costs nothing amortised, the
-  other one uses the cursor as a hint and falls back to a binary search, so nothing
-  depends on the order copies arrive in.
+The C libraries are patched where they decode a match. Each decoder installs the hook, with
+a pointer to its queue, right before every native decoding call and removes it right after
+(the decoders move, so no pointer outlives a call). With tracking off the hook is not
+installed: the C decoders pay one NULL check per match, and the gzip decoder runs the stock
+decoding loop, with no hook at all.
 
-## Measurements
+* **xz** (`external/lzma-sys`): reported from the LZMA decoder when a match's length is
+  decoded, not from `dict_repeat`, which stops at the end of the caller's buffer and resumes
+  the copy in the next call. The block decoder suppresses the hook for filtered Blocks.
+* **zstd** (`external/zstd-sys`): reported at the eight sequence-execution sites; a sequence
+  never spans blocks.
+* **lz4** (`external/lz4-sys`): reported at the four places `LZ4_decompress_generic` completes
+  a match; the frame decoder publishes the hook and the block's absolute offset around each
+  block it decodes.
+* **gzip**: `streaming-libdeflate-rs` already calls `DeflateOutput::on_lz_copy` for every
+  match when the output asks for it; the decompressors here pass an output that does, only
+  while tracking.
 
-`src/bin/analysis --min-len 62`, one thread, release profile, on the 200,000,000 byte tar
-of AllTheBacteria batch 104 recompressed four ways, and on the batch as it ships:
+Each fork's `PATCH.md` describes its change and how to replay it on a newer upstream, and
+`ggcat-lz-hook.patch` holds it as a diff.
 
-| input | compressed | output | plain decode | forward | backward |
-|---|---:|---:|---:|---:|---:|
-| `.tar.xz` (8 MiB dict) | 19.4 MB | 200 MB | 0.52 s | 0.42 s, 34 MB | 0.41 s, 34 MB |
-| `.tar.gz` (`-6`) | 58.0 MB | 200 MB | 0.72 s | 0.20 s, 13 MB | 0.20 s, 13 MB |
-| `.tar.zst` (`-3`) | 58.0 MB | 200 MB | 0.13 s | 0.20 s, 16 MB | 0.20 s, 16 MB |
-| `.tar.lz4` (`-9 -BD`) | 76.6 MB | 200 MB | 0.13 s | 0.10 s, 21 MB | 0.11 s, 21 MB |
-| `batch.104.tar.xz` | 5.0 MB | 837 MB | 0.36 s | 0.38 s, 225 MB | 0.37 s, 220 MB |
+## Coexisting with the stock crates
 
-Tracking costs almost nothing beyond decoding the stream, which has to happen anyway, and
-both directions report the same copies -- 94.5% of the bytes of `batch.104.tar.xz` are
-covered by copies of at least 62 bytes -- only attached to the other end.
+The C forks can be linked into the same binary as the genuine `liblzma-sys`, `zstd-sys` and
+`lz4-sys`: they claim their own `links` keys (`lzcb_lzma`, `lzcb_zstd`, `lzcb_lz4`) and every
+exported C symbol is renamed into the `lzcb_` namespace by a generated header,
+`lzcb_prefix.h`, force-included into every translation unit. Each fork's `tests/symbols.rs`
+fails if a symbol of its built archive lost the prefix, and this crate's tests link the
+stock crates next to the forks.
 
-## Vendored decompressors
+## Development
 
-The xz, zstd and lz4 backends need decoders that report every LZ match, which upstream does
-not offer, so `external/` carries three forks:
-
-| crate | upstream | what the fork adds |
-|---|---|---|
-| `lzcb-lzma-sys` | `liblzma-sys` 0.4.7 (XZ 5.8.3) | `lzma_lz_set_match_hook` in the LZ decoder |
-| `lzcb-zstd-sys` | `zstd-sys` 2.0.16 (zstd 1.5.7) | `ZSTD_DCtx_setLzMatchHook` at the sequence sites |
-| `lzcb-lz4-flex` | `lz4_flex` 0.11.6 | a `MatchHook` trait and `FrameDecoder::with_hook` |
-
-Each has a `PATCH.md` describing the change and a `ggcat-lz-hook.patch` to replay it on a
-newer upstream. The two `-sys` forks compile their C with every exported symbol renamed into
-the `lzcb_` namespace (`lzcb_prefix.h`, force-included into every translation unit) and claim
-their own `links` keys, so they can be linked into a binary that also links the genuine
-`liblzma-sys` / `zstd-sys` -- which is exactly what this crate's own test suite does, since
-its dev-dependencies pull the stock `liblzma`, `zstd` and `lz4` crates. A test in each fork
-re-reads the built archive and fails if any symbol lost its prefix.
-
-## Features
-
-`stats` (on by default) keeps the counters of `TrackerStats` and `TarStats`. Built without
-it -- `default-features = false` -- every `Stat` is a zero-sized type, so both structs are
-zero-sized, every `inc`/`add` compiles away and reading a counter gives `0`; the API is
-the same either way, and `Stat::ENABLED` says which build this is. `TrackingDecoder::
-window_size()` reports the window whether or not the counters are there. The
-`lz-copyback-stats` binary and every test that asserts on a counter declare
-`required-features = ["stats"]`, so a build without the feature skips them instead of
-failing.
-
-## Tools
-
-* `cargo run --bin lz-copyback-analysis` dumps tar members with the copies attached to
-  them (`--mode forward|backward`).
-* `cargo run --bin lz-copyback-stats` prints copy statistics for a set of files.
-* `cargo run --example lz_bench` measures decode speed with tracking off/on against the
-  plain readers -- the stock `liblzma`, `zstd`, `lz4` and `flate2` crates, which the test
-  and example builds link alongside the prefixed forks.
+* `cargo test --workspace`:
+  * `tests/copybacks.rs`: on all four decoders, correct raw matches, pushed in time,
+    independent of the read size, the threshold and the switch;
+  * `tests/lz4_frames.rs`: the lz4 matches equal the ones read straight from the frames;
+  * `tests/interface.rs`: truncated and concatenated inputs end as with the stock decoders,
+    and the extra methods behave;
+  * the symbol audits of the three forks.
+* `cargo bench --bench decode -- [--synthetic-mib N] [--read-size BYTES] [--real FILE.xz
+  --scratch DIR]` decodes each input once per configuration (stock decoder, tracking off,
+  tracking on at min 62 and at min 1) and prints throughput, copybacks and bytes covered.
+* `tools/gen-symbol-prefix.sh`, `tools/add-link-names.py` and `tools/gen-patch.sh`
+  regenerate a fork's prefix header, its `#[link_name]`s and its patch after an upstream
+  bump.

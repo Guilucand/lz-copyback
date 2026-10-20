@@ -24,12 +24,16 @@ pub unsafe extern "C" fn rust_lzcb_lzma_wasm_shim_free(ptr: *mut c_void) {
 }
 
 #[no_mangle]
-pub extern "C" fn rust_lzcb_lzma_wasm_shim_memcmp(
+pub unsafe extern "C" fn rust_lzcb_lzma_wasm_shim_memcmp(
     str1: *const c_void,
     str2: *const c_void,
     n: usize,
 ) -> i32 {
-    // Safety: function contracts requires str1 and str2 at least `n`-long.
+    if n == 0 {
+        return 0;
+    }
+
+    // SAFETY: function contracts requires str1 and str2 at least `n`-long.
     unsafe {
         let str1: &[u8] = core::slice::from_raw_parts(str1 as *const u8, n);
         let str2: &[u8] = core::slice::from_raw_parts(str2 as *const u8, n);
@@ -83,6 +87,10 @@ pub unsafe extern "C" fn rust_lzcb_lzma_wasm_shim_memchr(
     c: c_int,
     n: usize,
 ) -> *mut c_void {
+    if n == 0 {
+        return core::ptr::null_mut();
+    }
+
     let s_slice = unsafe { core::slice::from_raw_parts(s as *const u8, n) };
     s_slice
         .iter()
@@ -156,6 +164,19 @@ mod tests {
         let ptr = rust_lzcb_lzma_wasm_shim_malloc(usize::MAX);
 
         assert!(ptr.is_null());
+    }
+
+    #[test]
+    fn zero_length_ops_tolerate_null() {
+        let null = core::ptr::null_mut::<c_void>();
+
+        unsafe {
+            assert_eq!(rust_lzcb_lzma_wasm_shim_memcmp(null, null, 0), 0);
+            assert!(rust_lzcb_lzma_wasm_shim_memchr(null, b'x' as c_int, 0).is_null());
+            assert!(rust_lzcb_lzma_wasm_shim_memcpy(null, null, 0).is_null());
+            assert!(rust_lzcb_lzma_wasm_shim_memmove(null, null, 0).is_null());
+            assert!(rust_lzcb_lzma_wasm_shim_memset(null, 0, 0).is_null());
+        }
     }
 
     #[test]

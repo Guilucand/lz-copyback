@@ -1,14 +1,13 @@
 # zstd-sys, vendored and patched for ggcat
 
-Upstream: crates.io `zstd-sys` 2.0.16+zstd.1.5.7 (zstd 1.5.7, BSD-3-Clause OR GPL-2.0;
-bindings MIT OR Apache-2.0). Crate file sha256: `91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748`.
+Upstream: crates.io `zstd-sys` 2.1.2+zstd.1.5.7 (zstd 1.5.7, BSD-3-Clause OR GPL-2.0;
+bindings BSD-3-Clause since 2.1). Crate file sha256: `481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3`.
 
 ## Why
 
 `lz-copyback` reports every LZ match the decoder executes. zstd's sequence
-execution has no hook, so the block decoder is patched and the crate is built from this
-tree through `[patch.crates-io]`. With no hook installed the change is one NULL check per
-sequence; ggcat's existing zstd readers behave as before.
+execution has no hook, so the block decoder is patched. With no hook installed the change is
+one NULL check per sequence.
 
 ## Pruning
 
@@ -24,36 +23,47 @@ leaving a feature that no longer has sources would break any downstream `--featu
   `non-cargo`, `pkg-config`, `debug`, and **`bindgen`**.
 * the six unreachable `src/bindings_*.rs` files (two of which the vendored `src/lib.rs`
   already could not reach) and the `zdict.h` / `zstd_seekable.h` bindgen inputs.
-* `build.rs`'s pkg-config path: a system libzstd has no LZ hook, so the bundled source must
-  always be built.
+* `build.rs`'s pkg-config path (and with it 2.1's `ZSTD_SYS_USE_PKG_CONFIG`), 2.1's `cmake`
+  and `vendored` features and its `ZSTD_SYS_NO_HIDE_SYMBOLS` switch: a system libzstd has no
+  LZ hook and the cmake build would bypass `lzcb_prefix.h`, so the bundled source is always
+  built by `cc`. From 2.1's `build.rs` the fork keeps the assembly being built on x86_64
+  only and `-fvisibility=hidden` being skipped for MSVC targets.
 
 Deleting the `bindgen` feature is not cleanup but a correctness requirement: unlike
 liblzma-sys's same-named feature, it really does regenerate bindings at build time, and those
 would carry **unprefixed** names and bind silently to the stock library.
 
-That takes the archive from 581 exported symbols to 348. One behavioural consequence: a
-legacy v0.x frame is now rejected by `ZSTD_decompressStream` itself rather than by
-`lz_copyback`'s own `lzTotalOut` mismatch check.
+That takes the archive from 581 exported symbols to 348. A legacy v0.x frame is rejected by
+`ZSTD_decompressStream` itself.
 
 ## Patch (`ggcat-lz-hook.patch`)
 
-* `zstd/lib/decompress/zstd_decompress_internal.h`: `lzTotalOut`, `lzHook`, `lzHookCtx` in
-  `ZSTD_DCtx_s`; the `ZSTD_LZ_HOOK(dctx, ostart, op, seq)` macro reporting
+* `zstd/lib/decompress/zstd_decompress_internal.h`: `lzTotalOut`, `lzHook`, `lzHookCtx` and
+  `lzHookMinLen` in `ZSTD_DCtx_s`; the `ZSTD_LZ_HOOK(dctx, ostart, op, seq)` macro reporting
   `lzTotalOut + (op - ostart) + seq.litLength`, `seq.offset` (the resolved distance) and
-  `seq.matchLength`; prototypes of `ZSTD_DCtx_setLzMatchHook` and `ZSTD_DCtx_getLzTotalOut`.
+  `seq.matchLength` when the match is at least `lzHookMinLen` long (`SIZE_MAX` without a
+  hook, so a sequence costs one comparison and the short matches never leave C);
+  prototypes of `ZSTD_DCtx_setLzMatchHook(dctx, hook, ctx, minLength)` and
+  `ZSTD_DCtx_getLzTotalOut`.
 * `zstd/lib/decompress/zstd_decompress_block.c`: the macro at the eight sequence execution
   sites (`ZSTD_decompressSequences_bodySplitLitBuffer` x3, `ZSTD_decompressSequences_body`
   x1, `ZSTD_decompressSequencesLong_body` x4), right after the `ZSTD_execSequence*` error
-  check, so reports are in destination order even for the look-ahead Long variant.
+  check, so reports are in destination order even for the look-ahead Long variant. A
+  sequence is executed whole and never spans blocks, so every match is reported once, with
+  its full length.
 * `zstd/lib/decompress/zstd_decompress.c`: fields initialised in `ZSTD_initDCtx_internal`;
   `lzTotalOut` advanced per block in `ZSTD_decompressContinue` (streaming) and
-  `ZSTD_decompressFrame` (one-shot); the two new API functions. `ZSTD_DCtx_reset` leaves
-  the hook alone. Legacy (v0.x) frames bypass the counter; the Rust side detects the
-  mismatch and reports an error instead of mis-tracking.
+  `ZSTD_decompressFrame` (one-shot); the two new API functions. Nothing else resets
+  `lzTotalOut` -- not `ZSTD_DCtx_reset`, not the start of a frame -- so the offsets run on
+  across frames for the life of the context. In buffered output mode (the default) a block
+  is decoded into zstd's own buffer and flushed later, so its matches are reported up to
+  one block before their bytes reach the caller.
+* `src/lib.rs`: hand-written declarations of `ZSTD_DCtx_setLzMatchHook` and
+  `ZSTD_DCtx_getLzTotalOut`, so the pregenerated bindings are untouched.
 * `build.rs`: re-runs when the patched files change.
 
-The Rust side (`../../src/backends/zstd.rs`) declares the new functions and
-`ZSTD_getFrameHeader` itself, so the pregenerated bindings are untouched.
+The Rust side (`../../src/zstd.rs`) installs the hook around every `ZSTD_decompressStream`
+call and clears it afterwards.
 
 ## Packaging for crates.io (lzcb fork)
 
@@ -92,7 +102,8 @@ the guard for an upstream bump that adds a symbol.
 
 ## Upgrading
 
-1. Copy the new upstream tree from `~/.cargo/registry/src/*/`, prune as described above.
+1. Copy the new upstream tree from `~/.cargo/registry/src/*/`, prune as described above. The
+   zstd C sources of 2.1.2 are identical to 2.0.16's, so that bump only took the Rust side.
 2. `git apply -p1 ../../tools/../external/zstd-sys/ggcat-lz-hook.patch` from the crate
    directory and resolve any conflicts.
 3. Re-run `../../tools/gen-symbol-prefix.sh zstd-sys libzstd.a` -- the symbol list is not

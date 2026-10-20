@@ -1,13 +1,13 @@
 [package]
 name = "lz-copyback"
-version = "1.0.0"
+version = "2.0.0"
 authors = ["Andrea Cracco <guilucand@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
 readme = "README.md"
-keywords = ["compression", "lz77", "decompression", "streaming", "tar"]
-categories = ["compression", "encoding", "parsing"]
-description = "Compression-method agnostic streaming decompressor that reports forward LZ copies"
+keywords = ["compression", "lz77", "decompression", "xz", "zstd"]
+categories = ["compression"]
+description = "xz, zstd, lz4 and gzip decoders that report the LZ matches they decode"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/algbio/ggcat"
 
@@ -15,87 +15,30 @@ repository = "https://github.com/algbio/ggcat"
 name = "lz_copyback"
 doctest = false
 
-[features]
-default = ["stats"]
-# Keep the counters of `TrackerStats` and `TarStats`. Without it every `Stat` is a
-# zero-sized type, the counting compiles away and reading one gives zero, which is what a
-# consumer that only wants the copies should build.
-stats = []
-
 [dependencies]
-# Real library dependencies.
-bzip2 = "0.4.4"                 # src/open.rs: bzip2 passthrough backend
-crc32fast = "1.4"               # src/backends/deflate.rs: gzip CRC
-tar = "0.4"                     # src/tar/header.rs: ustar/PAX header parsing
-streaming-libdeflate-rs = "0.2.5"
-voracious_radix_sort = "1.2.0"  # src/sort.rs: ordering a window's copies by source
-
-# Patched decompressors, vendored under external/. The Rust-visible names are kept
-# so no `use` in src/ has to change.
-liblzma_sys = { package = "lzcb-lzma-sys", path = "external/lzma-sys", version = "0.1" }
-zstd_sys    = { package = "lzcb-zstd-sys", path = "external/zstd-sys", version = "0.1", default-features = false }
-lz4_flex    = { package = "lzcb-lz4-flex", path = "external/lz4-flex", version = "0.1", default-features = false, features = ["frame", "checked-decode"] }
+# Patched C libraries, vendored under external/ (see their PATCH.md).
+lzcb-lzma-sys = { path = "external/lzma-sys", version = "0.2.0" }
+lzcb-zstd-sys = { path = "external/zstd-sys", version = "0.2.0", default-features = false }
+lzcb-lz4-sys = { path = "external/lz4-sys", version = "0.1.0" }
+# Already has the match hook (`DeflateOutput::on_lz_copy`).
+streaming-libdeflate-rs = "0.3.0"
 
 [dev-dependencies]
 rand = "0.8.5"
-object = "0.37"                 # tests/ symbol audit
-# Reference decoders for the tests and the lz_bench example: these are the STOCK
-# crates, so every test binary links them next to the prefixed forks above. That
-# is the coexistence check -- if a symbol lost its prefix, this fails to link.
-flate2 = "1.0.30"
-zstd = "0.13.2"
-lz4 = "1.25.0"
-liblzma = { version = "0.4.7", features = ["static"] }
+# Stock encoders and decoders, to produce the test data and to compare against. Every test
+# binary links them next to the prefixed forks, which is the coexistence check: if a C
+# symbol lost its prefix, the link fails.
+flate2 = "1.1"
+liblzma = { version = "0.4.9", features = ["static"] }
+zstd = "0.13.3"
+lz4 = "1.28.1"
 
-[[bin]]
-name = "lz-copyback-analysis"
-path = "src/bin/analysis.rs"
-
-[[bin]]
-name = "lz-copyback-stats"
-path = "src/bin/lz_copyback_stats.rs"
-required-features = ["stats"]
-
-# Every test but `open` asserts on the counters, so they are skipped rather than failing
-# when the crate is built without them.
-[[test]]
-name = "backward"
-required-features = ["stats"]
-
-[[test]]
-name = "both"
-required-features = ["stats"]
-
-[[test]]
-name = "concurrency"
-required-features = ["stats"]
-
-[[test]]
-name = "mock_backend"
-required-features = ["stats"]
-
-[[test]]
-name = "roundtrip_gzip"
-required-features = ["stats"]
-
-[[test]]
-name = "roundtrip_lz4"
-required-features = ["stats"]
-
-[[test]]
-name = "roundtrip_xz"
-required-features = ["stats"]
-
-[[test]]
-name = "roundtrip_zstd"
-required-features = ["stats"]
-
-[[test]]
-name = "tar_tracking"
-required-features = ["stats"]
+[[bench]]
+name = "decode"
+harness = false
 
 [workspace]
-members = [".", "external/lzma-sys", "external/zstd-sys", "external/lz4-flex"]
+members = [".", "external/lzma-sys", "external/zstd-sys", "external/lz4-sys"]
 
 [profile.release]
 opt-level = 3

@@ -1,61 +1,53 @@
-//! Patched copies of the LZ decoders ggcat reads its inputs with, each reporting the LZ
-//! matches ("copybacks") it decodes.
+//! Decoders for the LZ formats ggcat reads (xz, zstd, lz4, gzip) that also report the LZ
+//! matches ("copybacks") they decode: which output bytes are verbatim repeats of earlier
+//! output.
 //!
-//! | codec | fork | decoder |
+//! | codec | decoder | interface of |
 //! |---|---|---|
-//! | xz | `lzcb-liblzma` (liblzma 0.4.9) | `lzcb_liblzma::read::XzDecoder` |
-//! | zstd | `lzcb-zstd` (zstd 0.13.3) | `lzcb_zstd::stream::read::Decoder` |
-//! | lz4 | `lzcb-lz4` (lz4 1.28.1) | `lzcb_lz4::Decoder` |
-//! | gzip | `streaming-libdeflate-rs` | `LibdeflateGzipFileDecompressor`, `LibdeflateGzipPushDecompressor` |
+//! | xz, also `.lzma` and `.lz` | [`xz::XzDecoder`] | `liblzma::read::XzDecoder` |
+//! | zstd | [`zstd::ZstdDecoder`] | `zstd::stream::read::Decoder` |
+//! | lz4 | [`lz4::Lz4Decoder`] | `lz4::Decoder` |
+//! | gzip | [`gzip::GzipFileDecompressor`], [`gzip::GzipPushDecompressor`] | `streaming_libdeflate_rs::{LibdeflateGzipFileDecompressor, LibdeflateGzipPushDecompressor}` |
 //!
-//! Every one of those decoders has the same three extra methods:
+//! [`gzip::GzipDecoder`] adds a [`std::io::Read`] over the push decompressor.
+//!
+//! xz, zstd and lz4 run on patched copies of their C libraries (`external/`), gzip on
+//! `streaming-libdeflate-rs` and its match hook. Every decoder has the same three extra
+//! methods:
 //!
 //! * `set_copybacks_tracking(bool)`: on at construction; while off, matches are ignored.
 //! * `set_copybacks_min_len(u32)`: matches shorter than this are ignored; 1 at construction.
-//! * `peek_copybacks() -> &mut VecDeque<(u64, u32, u32)>`: every match recorded so far, in
-//!   stream order. The decoder only ever pushes to the back; removing entries is up to
-//!   the caller.
+//! * `peek_copybacks() -> &mut VecDeque<Copyback>`: every match recorded so far, in stream
+//!   order. The decoder only ever pushes to the back; removing entries is up to the caller.
 //!
-//! A match is pushed during the call that hands out its first destination byte, or
-//! earlier: zstd and lz4 decode a whole block into a buffer of their own before handing
-//! it out, so their matches can arrive up to one block ahead of the bytes.
-//!
-//! The forks push plain tuples so they need no common dependency; this crate only names
-//! the tuple and its fields.
+//! A match is pushed during the call that hands out its first destination byte, or earlier:
+//! zstd and lz4 decode a whole block into a buffer of their own before handing it out, so
+//! their matches can arrive up to one block ahead of the bytes.
 
-/// One LZ match exactly as the decoder decoded it, never merged, clipped or split:
-/// `(destination, offset, len)`. See [`CopybackExt`] for the fields.
-pub type Copyback = (u64, u32, u32);
+mod copybacks;
+pub mod gzip;
+pub mod lz4;
+pub mod xz;
+pub mod zstd;
 
-/// The fields of a [`Copyback`] by name.
-#[allow(clippy::len_without_is_empty)]
-pub trait CopybackExt {
+/// One LZ match exactly as the decoder decoded it, never merged, clipped or split: the match
+/// writes `len` bytes at `destination`, copying them from `destination - offset` on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Copyback {
     /// Absolute offset of the first byte the match writes, counted from the first byte the
     /// decoder produced (across concatenated streams, frames and members).
-    fn destination(&self) -> u64;
-
-    /// How far back the source starts: the match copies the bytes from
-    /// `destination - offset` on. Smaller than [`Self::len`] for a match that overlaps its
-    /// own output (a periodic repeat).
-    fn offset(&self) -> u32;
-
+    pub destination: u64,
+    /// How far back the source starts. Smaller than `len` for a match that overlaps its own
+    /// output (a periodic repeat).
+    pub offset: u32,
     /// Number of bytes the match writes.
-    fn len(&self) -> u32;
+    pub len: u32,
 }
 
-impl CopybackExt for Copyback {
+impl Copyback {
+    /// Absolute offset of the first byte the match copies.
     #[inline(always)]
-    fn destination(&self) -> u64 {
-        self.0
-    }
-
-    #[inline(always)]
-    fn offset(&self) -> u32 {
-        self.1
-    }
-
-    #[inline(always)]
-    fn len(&self) -> u32 {
-        self.2
+    pub fn source(&self) -> u64 {
+        self.destination - self.offset as u64
     }
 }

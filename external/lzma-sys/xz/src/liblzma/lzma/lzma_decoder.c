@@ -568,6 +568,7 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 							state][pos_state]);
 
 					update_short_rep(state);
+					dict_report_match(&dict, rep0, 1);
 					dict_put(&dict, dict_get(&dict, rep0));
 					continue;
 				}
@@ -638,6 +639,7 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 		assert(len <= MATCH_LEN_MAX);
 
 		// Repeat len bytes from distance of rep0.
+		dict_report_match(&dict, rep0, len);
 		if (unlikely(dict_repeat(&dict, rep0, &len))) {
 			coder->sequence = SEQ_COPY;
 			goto out;
@@ -902,6 +904,9 @@ eopm:
 							state][pos_state]);
 
 					update_short_rep(state);
+					// Before the resume point, so that a
+					// resumed write is not reported again.
+					dict_report_match(&dict, rep0, 1);
 
 	case SEQ_SHORTREP:
 					if (dict_put_safe(&dict,
@@ -966,6 +971,10 @@ eopm:
 
 		assert(len >= MATCH_LEN_MIN);
 		assert(len <= MATCH_LEN_MAX);
+
+		// Before the resume point: a copy resumed at SEQ_COPY has
+		// already been reported, with its full length.
+		dict_report_match(&dict, rep0, len);
 
 	case SEQ_COPY:
 		if (unlikely(dict_repeat(&dict, rep0, &len))) {

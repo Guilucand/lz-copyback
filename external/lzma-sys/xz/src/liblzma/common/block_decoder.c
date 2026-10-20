@@ -12,6 +12,7 @@
 #include "block_decoder.h"
 #include "filter_decoder.h"
 #include "check.h"
+#include "lz_decoder.h"
 
 
 typedef struct {
@@ -50,6 +51,10 @@ typedef struct {
 
 	/// True if the integrity check won't be calculated and verified.
 	bool ignore_check;
+
+	/// ggcat LZ hook: true when the filter chain is not a lone LZMA2,
+	/// so the LZ match hook is suppressed while decoding this Block.
+	bool lz_hook_suppressed;
 } lzma_block_coder;
 
 
@@ -83,9 +88,15 @@ block_decode(void *coder_ptr, const lzma_allocator *allocator,
 			out_size - *out_pos,
 			coder->uncompressed_limit - coder->uncompressed_size);
 
+		bool hook_was_suppressed = false;
+		if (coder->lz_hook_suppressed)
+			hook_was_suppressed = lzma_lz_suppress_match_hook(true);
+
 		const lzma_ret ret = coder->next.code(coder->next.coder,
 				allocator, in, in_pos, in_stop,
 				out, out_pos, out_stop, action);
+		if (coder->lz_hook_suppressed)
+			lzma_lz_suppress_match_hook(hook_was_suppressed);
 
 		const size_t in_used = *in_pos - in_start;
 		const size_t out_used = *out_pos - out_start;
@@ -269,8 +280,19 @@ lzma_block_decoder_init(lzma_next_coder *next, const lzma_allocator *allocator,
 			? block->ignore_check : false;
 
 	// Initialize the filter chain.
-	return lzma_raw_decoder_init(&coder->next, allocator,
-			block->filters);
+	return_if_error(lzma_raw_decoder_init(&coder->next, allocator,
+			block->filters));
+
+	// ggcat LZ hook: only a lone LZMA2 filter writes its LZ output
+	// straight to out[]. A filter in front of it (BCJ, delta) rewrites
+	// those bytes, and BCJ may decode into a buffer of its own, so the
+	// matches would neither repeat output bytes nor point at the right
+	// offsets. The chain was validated by lzma_raw_decoder_init().
+	coder->lz_hook_suppressed
+			= block->filters[0].id != LZMA_FILTER_LZMA2
+			|| block->filters[1].id != LZMA_VLI_UNKNOWN;
+
+	return LZMA_OK;
 }
 
 

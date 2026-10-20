@@ -395,6 +395,9 @@
 #ifndef lzma_lz_set_match_hook
 #define lzma_lz_set_match_hook lzcb_lzma_lz_set_match_hook
 #endif
+#ifndef lzma_lz_suppress_match_hook
+#define lzma_lz_suppress_match_hook lzcb_lzma_lz_suppress_match_hook
+#endif
 #ifndef lzma_memlimit_get
 #define lzma_memlimit_get lzcb_lzma_memlimit_get
 #endif

@@ -1,10 +1,10 @@
-# Vendored copy of zstd-sys 2.0.16+zstd.1.5.7 with the ggcat LZ match hook (see PATCH.md).
+# Vendored copy of zstd-sys 2.1.2+zstd.1.5.7 with the ggcat LZ match hook (see PATCH.md).
 
 [package]
 edition = "2018"
 rust-version = "1.64"
 name = "lzcb-zstd-sys"
-version = "0.1.0+zstd.1.5.7"
+version = "0.2.0+zstd.1.5.7"
 authors = ["Alexandre Bury <alexandre.bury@gmail.com>"]
 build = "build.rs"
 links = "lzcb_zstd"
@@ -29,7 +29,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Fork of zstd-sys 2.0.16 (zstd 1.5.7) whose decoder reports every LZ match through a hook and whose C symbols are prefixed, for the lz-copyback crate."
+description = "Fork of zstd-sys 2.1.2 (zstd 1.5.7) whose decoder reports every LZ match through a hook and whose C symbols are prefixed, for the lz-copyback crate."
 readme = "Readme.md"
 keywords = [
     "zstd",
@@ -40,7 +40,7 @@ categories = [
     "api-bindings",
     "compression",
 ]
-license = "MIT OR Apache-2.0"
+license = "BSD-3-Clause"
 repository = "https://github.com/algbio/ggcat"
 # upstream: "https://github.com/gyscos/zstd-rs"
 
