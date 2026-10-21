@@ -432,12 +432,16 @@ extern "C" {
     // ggcat LZ hook: calls `hook` once for every match of at least `min_length` bytes
     // LZ4F_decompress() decodes in `ctx`, with the absolute offset of its destination
     // (counting every byte `ctx` decoded since it was created, across frames), its
-    // distance and its full length, until the hook is set to None.
+    // distance and its full length, until the hook is set to None. A shorter match is
+    // reported if it starts at `last_end`, `last_offset` back: where the last match
+    // reported ended, which `ctx` follows from there on.
     #[link_name = "lzcb_LZ4F_setLzMatchHook"]
     pub fn LZ4F_setLzMatchHook(ctx: LZ4FDecompressionContext,
                                hook: LZ4FLzMatchHook,
                                hook_ctx: *mut c_void,
-                               min_length: c_uint);
+                               min_length: c_uint,
+                               last_end: c_ulonglong,
+                               last_offset: c_uint);
 
 }
 

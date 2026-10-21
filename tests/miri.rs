@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{Codec, check_copybacks, decoder, drain, gzip_encode};
+use common::{Codec, check_copybacks, decoder, drain_min, gzip_encode};
 
 /// Repeats at a few distances, cheap to make under Miri.
 fn data(len: usize, seed: u64) -> Vec<u8> {
@@ -42,8 +42,7 @@ fn gzip_ring_wraps_with_chunks_across_its_end() {
     // 3001 shares no factor with the ring, so chunks straddle its end.
     for (chunk, ahead) in [(3001, 500), (64 << 10, 0)] {
         let mut decoder = decoder(Codec::Gzip, &encoded, chunk + ahead);
-        decoder.set_copybacks_min_len(20);
-        let drained = drain(&mut *decoder, chunk, ahead);
+        let drained = drain_min(&mut *decoder, chunk, ahead, 20);
         assert!(drained.out == expected, "chunk {chunk}: the bytes differ");
         check_copybacks(&drained.out, &drained.copybacks);
         assert!(!drained.copybacks.is_empty());

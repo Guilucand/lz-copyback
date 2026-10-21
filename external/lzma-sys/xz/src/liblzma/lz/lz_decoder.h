@@ -129,6 +129,13 @@ typedef struct {
 	/// is no hook, so that dict_report_match() needs a single comparison.
 	uint32_t hook_min_len;
 
+	/// Where the destination of the last match reported ends, and its
+	/// real distance: a match continuing it, at the same distance from its
+	/// end, is reported whatever its length (the tail of a repeat cut into
+	/// matches). UINT64_MAX while there is no hook.
+	uint64_t hook_last_end;
+	uint32_t hook_last_distance;
+
 	/// abs_base + pos is the absolute offset of buf[pos] in the decoded
 	/// stream. Valid only inside one call of lzma_lz_decoder.code().
 	uint64_t abs_base;
@@ -140,9 +147,12 @@ typedef struct {
 /// start of every decoding step, so it must be set before each lzma_code()
 /// call whose matches are of interest and cleared afterwards. out_abs_base is
 /// the absolute stream offset of the first byte that lzma_code() call writes;
-/// matches shorter than min_len bytes are not reported.
+/// matches shorter than min_len bytes are not reported, but for one whose
+/// destination starts at last_end, at real distance last_distance: where the
+/// last match reported ended, which the decoder then follows.
 extern void lzma_lz_set_match_hook(lzma_lz_match_hook hook, void *ctx,
-		uint64_t out_abs_base, uint32_t min_len);
+		uint64_t out_abs_base, uint32_t min_len,
+		uint64_t last_end, uint32_t last_distance);
 
 /// Suppress (true) or allow again (false) the calling thread's LZ match hook,
 /// returning the previous setting. The block decoder suppresses it while it
@@ -173,6 +183,16 @@ typedef struct {
 	/// The smallest dictionary allocated, set by the caller, so that the
 	/// bytes it still needs are not overwritten by the next ones.
 	size_t min_size;
+
+	/// Set by the caller: the dictionary is also larger than min_size by
+	/// the dictionary size the stream declares, as the caller keeps that
+	/// much more readable, as far back as a match can reach.
+	bool min_size_plus_dict;
+
+	/// The dictionary size the block being decoded declares, the longest
+	/// distance of its matches (rounded up as the dictionary is allocated),
+	/// set when the LZ decoder is initialised: 0 before.
+	size_t dict_size;
 
 	/// The current dictionary buffer, with `size` usable bytes.
 	uint8_t *buf;
@@ -301,11 +321,15 @@ dict_is_distance_valid(const lzma_dict *const dict, const size_t distance)
 /// output byte even when the dictionary is full and the copy is resumed in a
 /// later call.
 static inline void
-dict_report_match(const lzma_dict *dict, uint32_t distance, uint32_t len)
+dict_report_match(lzma_dict *dict, uint32_t distance, uint32_t len)
 {
-	if (len >= dict->hook_min_len)
-		dict->hook(dict->hook_ctx, dict->abs_base + dict->pos,
-				distance + 1, len);
+	const uint64_t dst = dict->abs_base + dict->pos;
+	if (len >= dict->hook_min_len || (dst == dict->hook_last_end
+			&& distance + 1 == dict->hook_last_distance)) {
+		dict->hook(dict->hook_ctx, dst, distance + 1, len);
+		dict->hook_last_end = dst + len;
+		dict->hook_last_distance = distance + 1;
+	}
 }
 
 

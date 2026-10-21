@@ -62,6 +62,10 @@ pub struct ZstdInPlaceDecoder<R> {
     header: Vec<u8>,
     /// The largest block of the frame being decoded, 0 between frames.
     block_max: usize,
+    /// The window of the last frame with one, and whether it is kept readable on top of
+    /// `retain`.
+    window: u64,
+    keep_window: bool,
     /// The content size the frame's header declares, if it does, and the bytes of the frame
     /// decoded so far.
     content_size: Option<u64>,
@@ -89,14 +93,17 @@ fn free_ring(ring: NonNull<u8>, len: usize) {
 
 impl<R: Read> ZstdInPlaceDecoder<R> {
     /// Decodes `reader`, keeping the last `retain` bytes readable (see [`InPlaceDecoder`]).
-    pub fn new(reader: R, retain: usize) -> io::Result<Self> {
+    /// `hard_min_len` is the hard threshold: the decoder itself leaves out the matches
+    /// shorter than it, or than the copybacks' `min_len` if shorter, but for those continuing
+    /// the last one reported (see [`InPlaceDecoder::set_copybacks_min_len`]).
+    pub fn new(reader: R, retain: usize, hard_min_len: u32) -> io::Result<Self> {
         let context = NonNull::new(unsafe { ffi::ZSTD_createDCtx() })
             .map(Context)
             .ok_or_else(|| io::Error::new(ErrorKind::OutOfMemory, "zstd: cannot create a context"))?;
         Ok(Self {
             reader: BufReader::with_capacity(unsafe { ffi::ZSTD_DStreamInSize() }, reader),
             context,
-            copybacks: Copybacks::new(),
+            copybacks: Copybacks::new(hard_min_len),
             ring: NonNull::dangling(),
             ring_len: 0,
             write: 0,
@@ -105,6 +112,8 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
             input: Vec::new(),
             header: Vec::new(),
             block_max: 0,
+            window: 0,
+            keep_window: false,
             content_size: None,
             frame_decoded: 0,
             in_frame: false,
@@ -152,13 +161,14 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
             return Err(io::Error::other("Frame requires too much memory for decoding"));
         }
         self.block_max = frame.blockSizeMax as usize;
+        self.window = frame.windowSize;
         // The window (the whole frame, if it declares its size) and a block of room to decode
         // the next one, or the retained bytes, a block decoded past them and that room; besides
         // what is wasted at the end of the ring when it wraps, less than a block. zstd's own
         // least size (ZSTD_decodingBufferSize_min) is the frame's size when that is smaller,
         // for a buffer that never wraps within the frame, which this ring does.
         let room = self.block_max + BLOCK_SLACK;
-        let needed = (frame.windowSize as usize + room).max(self.retain + 2 * room) + room;
+        let needed = (self.window as usize + room).max(self.retained() + 2 * room) + room;
         if needed > self.ring_len {
             if self.ring_len > 0 {
                 self.retired.push((self.ring, self.ring_len));
@@ -168,6 +178,12 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
             self.write = 0;
         }
         Ok(())
+    }
+
+    /// The bytes kept readable behind the target of a `decode_to`: the window too, with
+    /// [`InPlaceDecoder::retain_window`].
+    fn retained(&self) -> usize {
+        self.retain + if self.keep_window { self.window as usize } else { 0 }
     }
 
     /// Frees the retired rings that hold no readable byte anymore.
@@ -237,9 +253,10 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
 
         let track = self.copybacks.tracking;
         if track {
-            let min_len = self.copybacks.min_len;
+            let (min_len, last_end, last_offset) =
+                (self.copybacks.hard_min_len(), self.copybacks.last_end, self.copybacks.last_offset);
             let ctx = self.copybacks.hook_ctx();
-            unsafe { ffi::ZSTD_DCtx_setLzMatchHook(dctx, Some(copyback_hook), ctx, min_len) };
+            unsafe { ffi::ZSTD_DCtx_setLzMatchHook(dctx, Some(copyback_hook), ctx, min_len, last_end, last_offset) };
         }
         let dst = if self.ring_len > 0 { unsafe { self.ring.as_ptr().add(self.write) } } else { ptr::null_mut() };
         let capacity = if is_block {
@@ -261,7 +278,7 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
             )
         };
         if track {
-            unsafe { ffi::ZSTD_DCtx_setLzMatchHook(dctx, None, ptr::null_mut(), 0) };
+            unsafe { ffi::ZSTD_DCtx_setLzMatchHook(dctx, None, ptr::null_mut(), 0, u64::MAX, 0) };
         }
         let decoded = check(decoded)?;
         self.map.push(self.ring, self.write, decoded);
@@ -278,7 +295,7 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
 
 impl<R: Read> InPlaceDecoder for ZstdInPlaceDecoder<R> {
     fn decode_to(&mut self, target: u64) -> io::Result<u64> {
-        let protect = protected(target, self.retain);
+        let protect = protected(target, self.retained());
         while !self.finished && self.map.end() < target {
             if !self.step(protect)? {
                 self.finished = true;
@@ -318,6 +335,15 @@ impl<R: Read> InPlaceDecoder for ZstdInPlaceDecoder<R> {
 
     fn total_in(&self) -> u64 {
         self.total_in
+    }
+
+    fn window_size(&self) -> u64 {
+        self.window
+    }
+
+    fn retain_window(&mut self) {
+        assert_eq!(self.map.end(), 0, "zstd: the window is retained from the first byte only");
+        self.keep_window = true;
     }
 }
 

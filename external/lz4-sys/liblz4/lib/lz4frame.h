@@ -748,10 +748,12 @@ LZ4FLIB_STATIC_API LZ4F_CDict* LZ4F_createCDict_advanced(LZ4F_CustomMem customMe
  *  decodes in `dctx`, with its full length, until the hook is set to NULL. `dstAbs` counts every byte `dctx` decoded since
  *  it was created: the count is never reset, not even between frames. A block is decoded
  *  whole, so the matches of a block are reported when its first bytes are handed out.
+ *  A shorter match is reported if it starts at `lastEnd`, `lastOffset` back: where the last
+ *  match reported ended, which `dctx` follows from there on.
  */
 LZ4FLIB_STATIC_API void LZ4F_setLzMatchHook(LZ4F_dctx* dctx,
         void (*hook)(void* ctx, unsigned long long dstAbs, unsigned offset, unsigned matchLength),
-        void* ctx, unsigned minLength);
+        void* ctx, unsigned minLength, unsigned long long lastEnd, unsigned lastOffset);
 
 
 #if defined (__cplusplus)

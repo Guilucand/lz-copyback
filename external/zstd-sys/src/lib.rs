@@ -31,7 +31,9 @@ pub type ZSTD_lzMatchHook = ::core::option::Option<
 
 extern "C" {
     /// Installs `hook` on `dctx`, for every decoding call until it is cleared with
-    /// `None`; matches shorter than `min_length` bytes are not reported. Destinations
+    /// `None`; matches shorter than `min_length` bytes are not reported, but for one that
+    /// starts at `last_end`, `last_offset` back: where the last match reported ended, which
+    /// the context follows from there on. Destinations
     /// count every byte the context has decoded since it was created through
     /// `ZSTD_decompressContinue` (the buffer-less API, which the streaming one runs on but
     /// for whole frames that fit its output): the count is never reset, not between frames
@@ -42,6 +44,8 @@ extern "C" {
         hook: ZSTD_lzMatchHook,
         ctx: *mut ::core::ffi::c_void,
         min_length: ::core::ffi::c_uint,
+        last_end: ::core::ffi::c_ulonglong,
+        last_offset: ::core::ffi::c_uint,
     );
 
     /// Bytes `dctx` has decoded since it was created (the base of the hook's offsets).

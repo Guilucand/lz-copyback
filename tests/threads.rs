@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{Codec, check_copybacks, decoder, drain, gzip_encode, lz4_encode, sample, xz_encode, zstd_encode};
+use common::{Codec, check_copybacks, continues, decoder, drain_min, gzip_encode, lz4_encode, sample, xz_encode, zstd_encode};
 
 #[test]
 fn decoders_on_sixteen_threads_at_once_read_their_own_streams() {
@@ -25,12 +25,14 @@ fn decoders_on_sixteen_threads_at_once_read_their_own_streams() {
                     // while the other threads make theirs.
                     let (chunk, ahead) = (1000 + thread as usize * 37, 20_000);
                     let mut decoder = decoder(codec, &encoded, chunk + ahead);
-                    decoder.set_copybacks_min_len(8);
-                    let drained = drain(&mut *decoder, chunk, ahead);
+                    let drained = drain_min(&mut *decoder, chunk, ahead, 8);
                     assert!(drained.out == data, "thread {thread}, {codec:?}: the bytes differ");
                     check_copybacks(&drained.out, &drained.copybacks);
+                    // At least 8 bytes, or the rest of the one before, taken out as it grew.
+                    let copybacks = &drained.copybacks;
                     assert!(
-                        drained.copybacks.iter().all(|copyback| copyback.len >= 8),
+                        (0..copybacks.len()).all(|index| copybacks[index].len >= 8
+                            || index > 0 && continues(&copybacks[index - 1], &copybacks[index])),
                         "thread {thread}: another thread's threshold"
                     );
                 }

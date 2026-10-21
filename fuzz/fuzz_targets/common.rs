@@ -26,12 +26,12 @@ pub enum Codec {
     Gzip,
 }
 
-pub fn decoder(codec: Codec, encoded: &[u8], retain: usize) -> Option<Box<dyn InPlaceDecoder + '_>> {
+pub fn decoder(codec: Codec, encoded: &[u8], retain: usize, hard: u32) -> Option<Box<dyn InPlaceDecoder + '_>> {
     Some(match codec {
-        Codec::Xz => Box::new(XzInPlaceDecoder::new_multi_decoder(encoded, retain)),
-        Codec::Zstd => Box::new(ZstdInPlaceDecoder::new(encoded, retain).ok()?),
-        Codec::Lz4 => Box::new(Lz4InPlaceDecoder::new(encoded, retain).ok()?),
-        Codec::Gzip => Box::new(GzipInPlaceDecoder::new(encoded, retain)),
+        Codec::Xz => Box::new(XzInPlaceDecoder::new_multi_decoder(encoded, retain, hard)),
+        Codec::Zstd => Box::new(ZstdInPlaceDecoder::new(encoded, retain, hard).ok()?),
+        Codec::Lz4 => Box::new(Lz4InPlaceDecoder::new(encoded, retain, hard).ok()?),
+        Codec::Gzip => Box::new(GzipInPlaceDecoder::new(encoded, retain, hard)),
     })
 }
 
@@ -70,8 +70,9 @@ impl Params<'_> {
 }
 
 /// How a decoder is read: chunks of `chunk` bytes, `ahead` bytes decoded past each, `extra`
-/// more bytes retained, the shortest match recorded, and whether the tracking starts on and
-/// switches over at some point.
+/// more bytes retained, the window too or not, the shortest copyback recorded and the
+/// decoder's hard threshold, and whether the tracking starts on and switches over at some
+/// point.
 #[derive(Clone, Copy, Debug)]
 pub struct Reading {
     pub chunk: usize,
@@ -80,6 +81,8 @@ pub struct Reading {
     pub min_len: u32,
     pub tracking: bool,
     pub switch_at: Option<u64>,
+    pub keep_window: bool,
+    pub hard_min_len: u32,
 }
 
 impl Reading {
@@ -95,7 +98,14 @@ impl Reading {
         };
         let tracking = params.below(8) != 0;
         let switch_at = params.bool().then(|| params.u32() as u64 % (4 << 20));
-        Self { chunk, ahead, extra, min_len, tracking, switch_at }
+        let keep_window = params.bool();
+        let hard_min_len = match params.below(4) {
+            0 => 1,
+            1 => 32,
+            2 => 128,
+            _ => 1 + params.below(300),
+        };
+        Self { chunk, ahead, extra, min_len, tracking, switch_at, keep_window, hard_min_len }
     }
 
     pub fn retain(&self) -> usize {
@@ -126,10 +136,12 @@ const RECHECK: u64 = 256;
 /// is the next bytes; copybacks come no later than their bytes, in stream order, each a
 /// correct raw match of at least the shortest length (see [`check_copybacks`] for `sourceless`).
 pub fn read_checked(decoder: &mut dyn InPlaceDecoder, reading: &Reading, limit: u64, sourceless: bool) -> Outcome {
-    let retain = reading.retain() as u64;
     let mut tracking = reading.tracking;
     decoder.set_copybacks_min_len(reading.min_len);
     decoder.set_copybacks_tracking(tracking);
+    if reading.keep_window {
+        decoder.retain_window();
+    }
 
     let mut out: Vec<u8> = Vec::new();
     let mut copybacks = Vec::new();
@@ -148,6 +160,9 @@ pub fn read_checked(decoder: &mut dyn InPlaceDecoder, reading: &Reading, limit: 
             switched = true;
         }
         let target = position + (reading.chunk + reading.ahead) as u64;
+        // The window of the Block or frame being decoded as `decode_to` starts.
+        let window = if reading.keep_window { decoder.window_size() } else { 0 };
+        let retain = reading.retain() as u64 + window;
         let result = if error.is_none() { decoder.decode_to(target) } else { Ok(decoder.decoded_len()) };
         let decoded = decoder.decoded_len();
         assert!(decoded >= decoded_before, "the decoded length went back from {decoded_before} to {decoded}");
@@ -183,7 +198,9 @@ pub fn read_checked(decoder: &mut dyn InPlaceDecoder, reading: &Reading, limit: 
         }
         assert_eq!(out.len() as u64, end, "the pieces of {position}..{end} are not that long");
         for copyback in queue.drain(..) {
-            assert!(copyback.destination >= position, "{copyback:?} pushed after {position} bytes were handed out");
+            // No later than its first min_len bytes, the length that admits it to the queue.
+            let admitted = copyback.destination + reading.min_len.max(1) as u64;
+            assert!(admitted > position, "{copyback:?} pushed after {position} bytes were handed out");
             copybacks.push(copyback);
         }
         if end == position {
@@ -195,17 +212,22 @@ pub fn read_checked(decoder: &mut dyn InPlaceDecoder, reading: &Reading, limit: 
 }
 
 /// The invariants of every list of raw matches: in stream order, destinations never
-/// overlapping, each at least `min_len` bytes and a correct repeat of earlier output (byte by
+/// overlapping, each at least `min_len` bytes (or the rest of the one before, which the reader
+/// took out of the queue while it grew) and a correct repeat of earlier output (byte by
 /// byte, so an overlapping, periodic match is checked as it is decoded), as far as `out` goes.
 /// With `sourceless`, a match may reach before the start of the output: streaming-libdeflate-rs
 /// takes a corrupt deflate distance reaching before the stream's start, a known and accepted
 /// behaviour (it copies zeros, within its buffers), which the gzip trailer's checksum rejects.
 pub fn check_copybacks(out: &[u8], copybacks: &[Copyback], min_len: u32, sourceless: bool) {
     let mut next_free = 0;
+    let mut previous: Option<&Copyback> = None;
     for copyback in copybacks {
         let (dst, off, len) = (copyback.destination, copyback.offset as u64, copyback.len as u64);
         assert!(off > 0 && (sourceless || off <= dst), "{copyback:?} has no source in the output");
-        assert!(len >= min_len.max(1) as u64, "{copyback:?} is shorter than {min_len}");
+        // Shorter only as the rest of the one before, taken out of the queue as it grew.
+        let rest = previous.is_some_and(|p| p.offset == copyback.offset && p.destination + p.len as u64 == dst);
+        assert!(len >= min_len.max(1) as u64 || rest, "{copyback:?} is shorter than {min_len}");
+        previous = Some(copyback);
         assert!(dst >= next_free, "{copyback:?} overlaps the previous destination");
         next_free = dst + len;
         if off > dst {
@@ -340,7 +362,7 @@ pub fn raw(codec: Codec, bytes: &[u8]) {
     let (head, encoded) = bytes.split_at(bytes.len().min(PARAMS));
     let reading = Reading::new(&mut Params(head));
     let limit = reading.limit();
-    let Some(mut decoder) = decoder(codec, encoded, reading.retain()) else { return };
+    let Some(mut decoder) = decoder(codec, encoded, reading.retain(), reading.hard_min_len) else { return };
     let ours = read_checked(&mut *decoder, &reading, limit, codec == Codec::Gzip);
     drop(decoder);
     let (theirs, their_error) = stock(codec, encoded, limit);
@@ -417,7 +439,7 @@ pub fn data(params: &mut Params, seed: &[u8], max_len: usize) -> Vec<u8> {
 
 /// A round trip: `encoded` must decode, read as `reading` says, to exactly `expected`.
 pub fn round_trip(codec: Codec, encoded: &[u8], expected: &[u8], reading: &Reading) {
-    let mut decoder = decoder(codec, encoded, reading.retain()).expect("a decoder");
+    let mut decoder = decoder(codec, encoded, reading.retain(), reading.hard_min_len).expect("a decoder");
     let outcome = read_checked(&mut *decoder, reading, u64::MAX, false);
     if let Some(error) = &outcome.error {
         panic!("{codec:?}: failed ({error}) after {} of {} bytes", outcome.out.len(), expected.len());

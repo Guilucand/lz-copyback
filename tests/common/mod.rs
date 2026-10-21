@@ -19,13 +19,23 @@ pub enum Codec {
     Gzip,
 }
 
-/// The decoder of `codec` over `encoded`, keeping `retain` bytes readable.
+/// The hard threshold of the tests' decoders: below the larger soft thresholds they set, so
+/// that the decoders' own filter and the queue's both run.
+pub const HARD_MIN_LEN: u32 = 32;
+
+/// The decoder of `codec` over `encoded`, keeping `retain` bytes readable, with the hard
+/// threshold [`HARD_MIN_LEN`].
 pub fn decoder(codec: Codec, encoded: &[u8], retain: usize) -> Box<dyn InPlaceDecoder + '_> {
+    decoder_hard(codec, encoded, retain, HARD_MIN_LEN)
+}
+
+/// As [`decoder`], with the hard threshold `hard_min_len`.
+pub fn decoder_hard(codec: Codec, encoded: &[u8], retain: usize, hard_min_len: u32) -> Box<dyn InPlaceDecoder + '_> {
     match codec {
-        Codec::Xz => Box::new(XzInPlaceDecoder::new_multi_decoder(encoded, retain)),
-        Codec::Zstd => Box::new(ZstdInPlaceDecoder::new(encoded, retain).unwrap()),
-        Codec::Lz4 => Box::new(Lz4InPlaceDecoder::new(encoded, retain).unwrap()),
-        Codec::Gzip => Box::new(GzipInPlaceDecoder::new(encoded, retain)),
+        Codec::Xz => Box::new(XzInPlaceDecoder::new_multi_decoder(encoded, retain, hard_min_len)),
+        Codec::Zstd => Box::new(ZstdInPlaceDecoder::new(encoded, retain, hard_min_len).unwrap()),
+        Codec::Lz4 => Box::new(Lz4InPlaceDecoder::new(encoded, retain, hard_min_len).unwrap()),
+        Codec::Gzip => Box::new(GzipInPlaceDecoder::new(encoded, retain, hard_min_len)),
     }
 }
 
@@ -40,6 +50,18 @@ pub struct Drained {
 /// copybacks queued after each step. A copyback must arrive no later than the step that
 /// decodes its first destination byte: one pushed for bytes already handed out fails the test.
 pub fn try_drain(decoder: &mut dyn InPlaceDecoder, chunk: usize, ahead: usize) -> std::io::Result<Drained> {
+    try_drain_min(decoder, chunk, ahead, 1)
+}
+
+/// As [`try_drain`], the decoder's threshold set to `min_len`: a copyback must arrive no later
+/// than the step that decodes its first `min_len` bytes.
+pub fn try_drain_min(
+    decoder: &mut dyn InPlaceDecoder,
+    chunk: usize,
+    ahead: usize,
+    min_len: u32,
+) -> std::io::Result<Drained> {
+    decoder.set_copybacks_min_len(min_len);
     let mut out = Vec::new();
     let mut copybacks = Vec::new();
     loop {
@@ -52,7 +74,7 @@ pub fn try_drain(decoder: &mut dyn InPlaceDecoder, chunk: usize, ahead: usize) -
         }
         for copyback in queue.drain(..) {
             assert!(
-                copyback.destination >= position,
+                copyback.destination + min_len as u64 > position,
                 "{copyback:?} pushed after {position} bytes were handed out"
             );
             copybacks.push(copyback);
@@ -65,6 +87,11 @@ pub fn try_drain(decoder: &mut dyn InPlaceDecoder, chunk: usize, ahead: usize) -
 
 pub fn drain(decoder: &mut dyn InPlaceDecoder, chunk: usize, ahead: usize) -> Drained {
     try_drain(decoder, chunk, ahead).expect("decode error")
+}
+
+/// As [`drain`], the decoder's threshold set to `min_len`.
+pub fn drain_min(decoder: &mut dyn InPlaceDecoder, chunk: usize, ahead: usize, min_len: u32) -> Drained {
+    try_drain_min(decoder, chunk, ahead, min_len).expect("decode error")
 }
 
 /// The whole of `encoded`, decoded by the decoder of `codec`, read in 64 KiB chunks with
@@ -108,6 +135,28 @@ pub fn check_copybacks(out: &[u8], copybacks: &[Copyback]) {
         }
         next_free = dst + len;
     }
+}
+
+/// `copybacks` with each one continuing the one before, at the same offset, merged into it,
+/// as a decoder merges them while the one before is still in its queue: lists taken out of the
+/// queue at different times compare equal merged.
+pub fn merged(copybacks: &[Copyback]) -> Vec<Copyback> {
+    let mut out: Vec<Copyback> = Vec::with_capacity(copybacks.len());
+    for &copyback in copybacks {
+        if let Some(last) = out.last_mut() {
+            if last.offset == copyback.offset && last.destination + last.len as u64 == copyback.destination {
+                last.len += copyback.len;
+                continue;
+            }
+        }
+        out.push(copyback);
+    }
+    out
+}
+
+/// Whether `copyback` continues `before`: at the same offset, from where it ends.
+pub fn continues(before: &Copyback, copyback: &Copyback) -> bool {
+    before.offset == copyback.offset && before.destination + before.len as u64 == copyback.destination
 }
 
 /// Does some copyback repeat at least `min_cover` of the planted `len` bytes at `dst`, at

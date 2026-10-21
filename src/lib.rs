@@ -15,13 +15,21 @@
 //! caller's buffer, and the matches go to a queue:
 //!
 //! * `set_copybacks_tracking(bool)`: on at construction; while off, matches are ignored.
-//! * `set_copybacks_min_len(u32)`: matches shorter than this are ignored; 1 at construction.
-//! * `peek_copybacks() -> &mut VecDeque<Copyback>`: every match recorded so far, in stream
-//!   order. The decoder only ever pushes to the back; removing entries is up to the caller.
+//! * `set_copybacks_min_len(u32)`: copybacks shorter than this, their continuations merged,
+//!   are dropped; 1 at construction. The decoders themselves leave out the matches shorter
+//!   than the hard threshold their constructor takes, `hard_min_len` (or `min_len`, if
+//!   shorter), but for those that continue the last one reported, the tails of repeats.
+//! * `peek_copybacks() -> &mut VecDeque<Copyback>`: every copyback recorded so far, in stream
+//!   order: matches merged with the ones that continue them, at the same offset. The decoder
+//!   only pushes to the back, or extends the last entry, if it is still in the queue, with a
+//!   match that continues it (the rest of one the caller removed comes as an entry of its own,
+//!   however short); removing entries is up to the caller. A caller that already read the last
+//!   entry finds it longer when it grows.
 //!
-//! A match is pushed during the `decode_to` call that decodes its first destination byte, or
+//! A copyback is pushed during the `decode_to` call that decodes its first `min_len` bytes, or
 //! earlier: zstd and lz4 decode a whole block at once, so their matches can arrive up to one
-//! block ahead of the bytes asked for.
+//! block ahead of the bytes asked for. Until then it can still be dropped, and is kept out of
+//! the queue.
 
 mod copybacks;
 pub mod gzip;

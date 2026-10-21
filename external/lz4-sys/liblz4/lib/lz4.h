@@ -690,9 +690,11 @@ typedef struct {
     LZ4_lzMatchHook hook;
     void* ctx;
     unsigned long long base;   /* absolute offset of the block's first output byte */
-    unsigned minLength;        /* shorter matches are not reported */
+    unsigned minLength;        /* shorter matches are not reported, but for one continuing */
+    unsigned long long lastEnd; /* the last one reported: where it ends, */
+    unsigned lastOffset;       /* and its offset; updated by the decoder */
 } LZ4_lzHookState;
-LZ4LIB_STATIC_API void LZ4_setLzHookState(const LZ4_lzHookState* state);
+LZ4LIB_STATIC_API void LZ4_setLzHookState(LZ4_lzHookState* state);
 
 #endif   /* LZ4_STATIC_3504398509 */
 #endif   /* LZ4_STATIC_LINKING_ONLY */

@@ -33,20 +33,26 @@ typedef struct {
 	void *ctx;
 	uint64_t out_abs_base;
 	uint32_t min_len;
+	uint64_t last_end;
+	uint32_t last_distance;
 	bool suppressed;
 } lzma_lz_hook_state;
 
-static LZMA_LZ_TLS lzma_lz_hook_state lz_hook_tls = { NULL, NULL, 0, 0, false };
+static LZMA_LZ_TLS lzma_lz_hook_state lz_hook_tls
+		= { NULL, NULL, 0, 0, UINT64_MAX, 0, false };
 
 
 extern void
 lzma_lz_set_match_hook(lzma_lz_match_hook hook, void *ctx,
-		uint64_t out_abs_base, uint32_t min_len)
+		uint64_t out_abs_base, uint32_t min_len,
+		uint64_t last_end, uint32_t last_distance)
 {
 	lz_hook_tls.hook = hook;
 	lz_hook_tls.ctx = ctx;
 	lz_hook_tls.out_abs_base = out_abs_base;
 	lz_hook_tls.min_len = min_len;
+	lz_hook_tls.last_end = last_end;
+	lz_hook_tls.last_distance = last_distance;
 }
 
 
@@ -268,6 +274,9 @@ decode_buffer(lzma_coder *coder,
 		coder->dict.hook_ctx = lz_hook_tls.ctx;
 		coder->dict.hook_min_len = hooked
 				? lz_hook_tls.min_len : UINT32_MAX;
+		coder->dict.hook_last_end = hooked
+				? lz_hook_tls.last_end : UINT64_MAX;
+		coder->dict.hook_last_distance = lz_hook_tls.last_distance;
 		coder->dict.abs_base = lz_hook_tls.out_abs_base
 				+ (uint64_t)(*out_pos) - (uint64_t)dict_start;
 
@@ -275,6 +284,13 @@ decode_buffer(lzma_coder *coder,
 		const lzma_ret ret = coder->lz.code(
 				coder->lz.coder, &coder->dict,
 				in, in_pos, in_size);
+
+		// The next step goes on from the last match reported.
+		if (hooked) {
+			lz_hook_tls.last_end = coder->dict.hook_last_end;
+			lz_hook_tls.last_distance
+					= coder->dict.hook_last_distance;
+		}
 
 		if (!coder->dict.has_wrapped && coder->dict.pos
 				- coder->dict.full_base >= coder->dict.size
@@ -429,6 +445,8 @@ lzma_lz_decoder_init(lzma_next_coder *next, const lzma_allocator *allocator,
 		coder->dict.hook = NULL;
 		coder->dict.hook_ctx = NULL;
 		coder->dict.hook_min_len = UINT32_MAX;
+		coder->dict.hook_last_end = UINT64_MAX;
+		coder->dict.hook_last_distance = 0;
 		coder->dict.abs_base = 0;
 		coder->lz = LZMA_LZ_DECODER_INIT;
 		coder->next = LZMA_NEXT_CODER_INIT;
@@ -473,17 +491,27 @@ lzma_lz_decoder_init(lzma_next_coder *next, const lzma_allocator *allocator,
 	// caller's state. The dictionary is at least as large as the caller
 	// needs, and one large enough is kept, so that the bytes decoded so far
 	// stay readable; one too small is handed to the caller (dict_free()).
-	const lzma_lz_in_place *in_place = lz_in_place_tls;
+	lzma_lz_in_place *in_place = lz_in_place_tls;
 	if (in_place == NULL)
 		return LZMA_PROG_ERROR;
 
 	if (lz_options.preset_dict != NULL && lz_options.preset_dict_size > 0)
 		return LZMA_OPTIONS_ERROR;
 
-	if (in_place->min_size > SIZE_MAX - 15 - LZ_DICT_EXTRA)
+	// The caller can keep a whole dictionary readable besides the bytes
+	// it needs.
+	size_t min_request = in_place->min_size;
+	if (in_place->min_size_plus_dict) {
+		if (min_request > SIZE_MAX - lz_options.dict_size)
+			return LZMA_MEM_ERROR;
+		min_request += lz_options.dict_size;
+	}
+
+	if (min_request > SIZE_MAX - 15 - LZ_DICT_EXTRA)
 		return LZMA_MEM_ERROR;
 
-	const size_t min_size = (in_place->min_size + 15) & ~((size_t)(15));
+	const size_t min_size = (min_request + 15) & ~((size_t)(15));
+	in_place->dict_size = lz_options.dict_size;
 	if (alloc_size < min_size)
 		alloc_size = min_size;
 

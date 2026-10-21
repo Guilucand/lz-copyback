@@ -40,6 +40,22 @@ const BLOCK_SLACK: usize = 64;
 /// The smallest frame header: the first input asked for.
 const HEADER_MIN: usize = 7;
 
+/// How far back an lz4 match reaches at most: its offsets are 16 bits.
+const WINDOW: usize = 64 << 10;
+
+/// A ring keeping `retain` bytes readable: those, a block decoded past them, a block of room
+/// for the next one, and what is wasted at the end of the ring when it wraps; liblz4 keeps
+/// 64 KiB of history before the block it decodes.
+fn alloc_ring(retain: usize) -> (NonNull<u8>, usize) {
+    let len = retain + 3 * (MAX_BLOCK + BLOCK_SLACK) + WINDOW;
+    let buffer: Box<[u8]> = vec![0; len].into_boxed_slice();
+    (NonNull::new(Box::into_raw(buffer) as *mut u8).unwrap(), len)
+}
+
+fn free_ring(ring: NonNull<u8>, len: usize) {
+    drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(ring.as_ptr(), len)) });
+}
+
 /// An lz4 frame from any reader, decoded in place: each block is decoded straight into a
 /// ring buffer (see [`InPlaceDecoder`]), the input being fed as liblz4 asks for it, a block
 /// at a time. Like upstream's decoder, it stops after the first frame; an input that ends
@@ -68,20 +84,18 @@ unsafe impl<R: Send> Send for Lz4InPlaceDecoder<R> {}
 
 impl<R: Read> Lz4InPlaceDecoder<R> {
     /// Decodes the lz4 frame read from `reader`, keeping the last `retain` bytes readable
-    /// (see [`InPlaceDecoder`]).
-    pub fn new(reader: R, retain: usize) -> io::Result<Self> {
+    /// (see [`InPlaceDecoder`]). `hard_min_len` is the hard threshold: the decoder itself leaves out the matches
+    /// shorter than it, or than the copybacks' `min_len` if shorter, but for those continuing
+    /// the last one reported (see [`InPlaceDecoder::set_copybacks_min_len`]).
+    pub fn new(reader: R, retain: usize, hard_min_len: u32) -> io::Result<Self> {
         let mut context = ffi::LZ4FDecompressionContext(ptr::null_mut());
         check(unsafe { ffi::LZ4F_createDecompressionContext(&mut context, ffi::LZ4F_VERSION) })?;
-        // The retained bytes, a block decoded past them, a block of room for the next one,
-        // and what is wasted at the end of the ring when it wraps; liblz4 keeps 64 KiB of
-        // history before the block it decodes.
-        let ring_len = retain + 3 * (MAX_BLOCK + BLOCK_SLACK) + (64 << 10);
-        let buffer: Box<[u8]> = vec![0; ring_len].into_boxed_slice();
+        let (ring, ring_len) = alloc_ring(retain);
         Ok(Self {
             reader,
             context: Context(context),
-            copybacks: Copybacks::new(),
-            ring: NonNull::new(Box::into_raw(buffer) as *mut u8).unwrap(),
+            copybacks: Copybacks::new(hard_min_len),
+            ring,
             ring_len,
             write: 0,
             map: RingMap::default(),
@@ -138,9 +152,12 @@ impl<R: Read> Lz4InPlaceDecoder<R> {
         let mut dst_size = self.ring_len - self.write;
         let track = self.copybacks.tracking;
         if track {
-            let min_len = self.copybacks.min_len;
+            let (min_len, last_end, last_offset) =
+                (self.copybacks.hard_min_len(), self.copybacks.last_end, self.copybacks.last_offset);
             let ctx = self.copybacks.hook_ctx();
-            unsafe { ffi::LZ4F_setLzMatchHook(self.context.0, Some(copyback_hook), ctx, min_len) };
+            unsafe {
+                ffi::LZ4F_setLzMatchHook(self.context.0, Some(copyback_hook), ctx, min_len, last_end, last_offset)
+            };
         }
         let code = unsafe {
             ffi::LZ4F_decompress(
@@ -153,7 +170,7 @@ impl<R: Read> Lz4InPlaceDecoder<R> {
             )
         };
         if track {
-            unsafe { ffi::LZ4F_setLzMatchHook(self.context.0, None, ptr::null_mut(), 0) };
+            unsafe { ffi::LZ4F_setLzMatchHook(self.context.0, None, ptr::null_mut(), 0, u64::MAX, 0) };
         }
         self.next = check(code)?;
         self.input_pos += src_size;
@@ -203,10 +220,21 @@ impl<R: Read> InPlaceDecoder for Lz4InPlaceDecoder<R> {
     fn total_in(&self) -> u64 {
         self.total_in
     }
+
+    fn window_size(&self) -> u64 {
+        WINDOW as u64
+    }
+
+    fn retain_window(&mut self) {
+        assert_eq!(self.map.end(), 0, "lz4: the window is retained from the first byte only");
+        self.retain += WINDOW;
+        free_ring(self.ring, self.ring_len);
+        (self.ring, self.ring_len) = alloc_ring(self.retain);
+    }
 }
 
 impl<R> Drop for Lz4InPlaceDecoder<R> {
     fn drop(&mut self) {
-        drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(self.ring.as_ptr(), self.ring_len)) });
+        free_ring(self.ring, self.ring_len);
     }
 }

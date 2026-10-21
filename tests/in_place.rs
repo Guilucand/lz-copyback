@@ -6,7 +6,7 @@
 mod common;
 
 use common::{
-    Codec, check_copybacks, decoder, fasta, gzip_encode, lz4_encode, plant, random_bytes, xz_encode, xz_encode_bcj, zstd_encode,
+    Codec, check_copybacks, decoder, fasta, merged, gzip_encode, lz4_encode, plant, random_bytes, xz_encode, xz_encode_bcj, zstd_encode,
 };
 use lz_copyback::lz4::Lz4InPlaceDecoder;
 use lz_copyback::xz::XzInPlaceDecoder;
@@ -84,7 +84,10 @@ fn check_with(codec: Codec, encoded: &[u8], sizes: &[(usize, usize)]) {
                 check_copybacks(&expected, &found);
                 reference = Some(found);
             }
-            Some(reference) => assert!(found == *reference, "chunk {chunk}, ahead {ahead}: the copybacks differ"),
+            // Taken out at other times, the queue merged other continuations.
+            Some(reference) => {
+                assert!(merged(&found) == merged(reference), "chunk {chunk}, ahead {ahead}: the copybacks differ")
+            }
         }
     }
 }
@@ -184,7 +187,7 @@ fn lzma_alone() {
 fn xz_truncated_is_an_error() {
     let mut encoded = xz_encode(&data(16, 1 << 20), 8 << 20);
     encoded.truncate(encoded.len() / 2);
-    let mut decoder = XzInPlaceDecoder::new_multi_decoder(encoded.as_slice(), 1 << 16);
+    let mut decoder = XzInPlaceDecoder::new_multi_decoder(encoded.as_slice(), 1 << 16, u32::MAX);
     assert!(decoder.decode_to(u64::MAX).is_err());
 }
 
@@ -228,8 +231,40 @@ fn zstd_incompressible() {
 fn zstd_truncated_is_an_error() {
     let mut encoded = zstd_encode(&data(26, 1 << 20), 20);
     encoded.truncate(encoded.len() / 2);
-    let mut decoder = ZstdInPlaceDecoder::new(encoded.as_slice(), 1 << 16).unwrap();
+    let mut decoder = ZstdInPlaceDecoder::new(encoded.as_slice(), 1 << 16, u32::MAX).unwrap();
     assert!(decoder.decode_to(u64::MAX).is_err());
+}
+
+/// With the window retained, every byte from `target - retain - window_size()` on is readable
+/// after `decode_to(target)`; the window is the one the format or the header declares, 0 for xz
+/// and zstd before their first header.
+#[test]
+fn the_window_is_retained_on_top_of_the_bytes_to_retain() {
+    let data = data(40, 3 << 20);
+    let cases = [
+        (Codec::Xz, xz_encode(&data, 1 << 20), 1 << 20, 0),
+        (Codec::Zstd, zstd_encode(&data, 20), 1 << 20, 0),
+        (Codec::Lz4, lz4_encode(&data, true, lz4::BlockSize::Max64KB), 64 << 10, 64 << 10),
+        (Codec::Gzip, gzip_encode(&data, 6), 32 << 10, 32 << 10),
+    ];
+    for (codec, encoded, window, before) in cases {
+        let retain = 4096u64;
+        let mut decoder = decoder(codec, &encoded, retain as usize);
+        assert_eq!(decoder.window_size(), before, "{codec:?} before any header");
+        decoder.retain_window();
+        let mut target = 0;
+        loop {
+            target += 100_000;
+            let decoded = decoder.decode_to(target).unwrap();
+            assert_eq!(decoder.window_size(), window, "{codec:?}");
+            let oldest = target.saturating_sub(retain + window).min(decoded);
+            let bytes: Vec<u8> = decoder.bytes(oldest..decoded).flatten().copied().collect();
+            assert!(bytes == data[oldest as usize..decoded as usize], "{codec:?}: retained bytes at {oldest}");
+            if decoded < target {
+                break;
+            }
+        }
+    }
 }
 
 fn check_lz4(encoded: &[u8]) {
@@ -259,7 +294,7 @@ fn lz4_ring_wraps() {
 fn lz4_truncated_is_an_error() {
     let mut encoded = lz4_encode(&data(32, 1 << 20), true, lz4::BlockSize::Max64KB);
     encoded.truncate(encoded.len() - 100);
-    let mut decoder = Lz4InPlaceDecoder::new(encoded.as_slice(), 1 << 16).unwrap();
+    let mut decoder = Lz4InPlaceDecoder::new(encoded.as_slice(), 1 << 16, u32::MAX).unwrap();
     assert!(decoder.decode_to(u64::MAX).is_err());
 }
 
@@ -283,10 +318,10 @@ fn gzip_damage_is_an_error() {
     let mut encoded = gzip_encode(&data(44, 1 << 20), 6);
     let crc = encoded.len() - 8;
     encoded[crc] ^= 0xff;
-    let mut decoder = GzipInPlaceDecoder::new(encoded.as_slice(), 1 << 16);
+    let mut decoder = GzipInPlaceDecoder::new(encoded.as_slice(), 1 << 16, u32::MAX);
     assert!(decoder.decode_to(u64::MAX).is_err());
     encoded[crc] ^= 0xff;
     encoded.truncate(encoded.len() / 2);
-    let mut decoder = GzipInPlaceDecoder::new(encoded.as_slice(), 1 << 16);
+    let mut decoder = GzipInPlaceDecoder::new(encoded.as_slice(), 1 << 16, u32::MAX);
     assert!(decoder.decode_to(u64::MAX).is_err());
 }

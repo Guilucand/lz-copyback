@@ -34,10 +34,13 @@ every re-vendor, for about 60 symbols that the `lzcb_` prefix already isolates.
 * `xz/src/liblzma/lz/lz_decoder.h`: the `lzma_lz_match_hook` typedef; `hook`, `hook_ctx`,
   `hook_min_len` and `abs_base` fields in `lzma_dict`; `dict_report_match()`, which calls the
   hook with `abs_base + pos`, `distance + 1` and the full match length when the length
-  reaches `hook_min_len` (`UINT32_MAX` without a hook, so a match costs one comparison and
-  the short ones never leave C); the prototypes of `lzma_lz_set_match_hook` and
-  `lzma_lz_suppress_match_hook`.
-* `xz/src/liblzma/lzma/lzma_decoder.c`: `dict_report_match()` once per match, at the point
+  reaches `hook_min_len` (`UINT32_MAX` without a hook, so a match costs two comparisons and
+  the short ones never leave C), or when the match continues the last one reported: its
+  destination at `hook_last_end`, at distance `hook_last_distance`, which it then updates
+  (`UINT64_MAX` without a hook), so the tail of a repeat cut into matches is kept however
+  short; the prototypes of `lzma_lz_set_match_hook` and `lzma_lz_suppress_match_hook`.
+* `xz/src/liblzma/lzma/lzma_decoder.c`: the local dictionary's `hook_last_end` and
+  `hook_last_distance` written back with `pos` and `full`; `dict_report_match()` once per match, at the point
   where its length is known and before it is copied: the fast path's short rep and the call
   in front of its `dict_repeat()`; the slow path's short rep and the call in front of
   `case SEQ_COPY:`, both placed *before* the resume labels so that a copy resumed in a later
@@ -50,9 +53,10 @@ every re-vendor, for about 60 symbols that the `lzcb_` prefix already isolates.
   even when the dictionary is full and the copy is resumed later, since `decode_buffer()`
   recomputes `abs_base` around every `lz.code()` call.
 * `xz/src/liblzma/lz/lz_decoder.c`: the thread-local hook state, `lzma_lz_set_match_hook(hook,
-  ctx, out_abs_base, min_len)` and `lzma_lz_suppress_match_hook(bool)`; `decode_buffer()`
-  copies the state into the dictionary before each `lz.code()` call (no hook while
-  suppressed) and sets
+  ctx, out_abs_base, min_len, last_end, last_distance)` and
+  `lzma_lz_suppress_match_hook(bool)`; `decode_buffer()` copies the state into the dictionary
+  before each `lz.code()` call (no hook while suppressed), the last match's end and distance
+  back after it, and sets
   `abs_base = out_abs_base + *out_pos - dict_start`, which is exact because
   `dict.buf[dict_start..pos]` is `out[*out_pos..]` (decoding in place, below; a filtered
   Block's bytes are copied there, and report nothing); the fields are initialised in
@@ -88,7 +92,10 @@ from the dictionary instead of having them copied out of it. The caller installs
     there (`full_base`), across the wrap that may follow before the dictionary is full again;
     `decode_buffer()` stops where it becomes full, to set `has_wrapped`. A new dictionary
     starts at `LZ_DICT_INIT_POS`, as upstream's.
-  * `lzma_lz_decoder_init()` allocates at least the state's `min_size` and keeps a dictionary
+  * `lzma_lz_decoder_init()` allocates at least the state's `min_size`, plus the declared
+    dictionary size when the state's `min_size_plus_dict` is set (the caller then keeps a whole
+    dictionary readable, as far back as a match reaches), reports that dictionary size in the
+    state's `dict_size`, and keeps a dictionary
     large enough, so that the bytes in it stay; one too small, or freed with its coder
     (`lz_decoder_end()`, when a Block's filter chain differs from the previous one), goes to
     the state's `retire` callback instead of being freed. Preset dictionaries (raw decoders

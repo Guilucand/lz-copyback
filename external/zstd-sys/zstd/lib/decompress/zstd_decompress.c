@@ -255,6 +255,8 @@ static void ZSTD_initDCtx_internal(ZSTD_DCtx* dctx)
     dctx->lzHook = NULL;
     dctx->lzHookCtx = NULL;
     dctx->lzHookMinLen = (size_t)-1;
+    dctx->lzHookLastEnd = (U64)-1;
+    dctx->lzHookLastOffset = 0;
     dctx->staticSize  = 0;
     dctx->ddict       = NULL;
     dctx->ddictLocal  = NULL;
@@ -2416,14 +2418,18 @@ size_t ZSTD_decompressStream_simpleArgs (
 
 
 /* ggcat LZ hook API (see zstd_decompress_internal.h): matches shorter than
- * minLength bytes are not reported. */
+ * minLength bytes are not reported, but for one that starts at lastEnd, at
+ * distance lastOffset: where the last match reported ended, which the
+ * decoder follows from there on. */
 void ZSTD_DCtx_setLzMatchHook(ZSTD_DCtx* dctx,
         void (*hook)(void* ctx, unsigned long long dstAbs, unsigned distance, unsigned matchLength),
-        void* ctx, unsigned minLength)
+        void* ctx, unsigned minLength, unsigned long long lastEnd, unsigned lastOffset)
 {
     dctx->lzHook = hook;
     dctx->lzHookCtx = ctx;
     dctx->lzHookMinLen = hook != NULL ? (size_t)minLength : (size_t)-1;
+    dctx->lzHookLastEnd = hook != NULL ? (U64)lastEnd : (U64)-1;
+    dctx->lzHookLastOffset = lastOffset;
 }
 
 unsigned long long ZSTD_DCtx_getLzTotalOut(const ZSTD_DCtx* dctx)

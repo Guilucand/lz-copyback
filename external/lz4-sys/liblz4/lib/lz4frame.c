@@ -1284,14 +1284,21 @@ struct LZ4F_dctx_s {
     LZ4_lzMatchHook lzHook;
     void*  lzHookCtx;
     unsigned lzHookMinLength;
+    /* Where the destination of the last match reported ends, and its offset: a match
+     * continuing it is reported whatever its length. */
+    U64    lzHookLastEnd;
+    unsigned lzHookLastOffset;
 };  /* typedef'd to LZ4F_dctx in lz4frame.h */
 
 
-void LZ4F_setLzMatchHook(LZ4F_dctx* dctx, LZ4_lzMatchHook hook, void* ctx, unsigned minLength)
+void LZ4F_setLzMatchHook(LZ4F_dctx* dctx, LZ4_lzMatchHook hook, void* ctx, unsigned minLength,
+                         unsigned long long lastEnd, unsigned lastOffset)
 {
     dctx->lzHook = hook;
     dctx->lzHookCtx = ctx;
     dctx->lzHookMinLength = minLength;
+    dctx->lzHookLastEnd = lastEnd;
+    dctx->lzHookLastOffset = lastOffset;
 }
 
 /* ggcat LZ hook: LZ4_decompress_safe_usingDict() with the dctx's hook published for the
@@ -1302,11 +1309,15 @@ static int LZ4F_decompressBlock(LZ4F_dctx* dctx, const char* src, char* dst,
 {
     int decodedSize;
     if (dctx->lzHook != NULL) {
-        LZ4_lzHookState const state = { dctx->lzHook, dctx->lzHookCtx, dctx->lzTotalOut,
-                                        dctx->lzHookMinLength };
+        LZ4_lzHookState state = { dctx->lzHook, dctx->lzHookCtx, dctx->lzTotalOut,
+                                  dctx->lzHookMinLength, dctx->lzHookLastEnd,
+                                  dctx->lzHookLastOffset };
         LZ4_setLzHookState(&state);
         decodedSize = LZ4_decompress_safe_usingDict(src, dst, srcSize, dstCapacity, dict, dictSize);
         LZ4_setLzHookState(NULL);
+        /* The next block goes on from the last match reported. */
+        dctx->lzHookLastEnd = state.lastEnd;
+        dctx->lzHookLastOffset = state.lastOffset;
     } else {
         decodedSize = LZ4_decompress_safe_usingDict(src, dst, srcSize, dstCapacity, dict, dictSize);
     }

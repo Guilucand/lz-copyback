@@ -10,7 +10,8 @@ use std::ptr::NonNull;
 /// A decoder that decodes into a ring buffer of its own, and hands its output out of it
 /// rather than copying it into the caller's buffer. The ring keeps the last bytes decoded: a
 /// decoder created with `retain` keeps, after [`Self::decode_to`]`(target)`, every byte from
-/// `target - retain` on readable with [`Self::bytes`], until the next `decode_to`.
+/// `target - retain` on readable with [`Self::bytes`], until the next `decode_to`; with
+/// [`Self::retain_window`], from `target - retain - window_size()` on.
 ///
 /// The decoders of the crate: [`crate::xz::XzInPlaceDecoder`],
 /// [`crate::zstd::ZstdInPlaceDecoder`], [`crate::lz4::Lz4InPlaceDecoder`] and
@@ -40,18 +41,42 @@ pub trait InPlaceDecoder {
     fn bytes_and_copybacks(&mut self, range: Range<u64>)
     -> (Pieces<'_>, &mut VecDeque<Copyback>);
 
-    /// Every LZ match recorded so far, in stream order. The decoder only pushes to the back
-    /// of the queue; removing entries is up to the caller.
+    /// Every copyback recorded so far, in stream order. The decoder only pushes to the back
+    /// of the queue, or extends its last entry with a match that continues it, at the same
+    /// offset, from where it ends: a long repeat cut into matches comes as one entry, as long
+    /// as the last one stays in the queue (the rest of one the caller removed comes as an entry
+    /// of its own, however short). Removing entries is up to the caller.
     fn peek_copybacks(&mut self) -> &mut VecDeque<Copyback>;
 
     /// Turns the recording of LZ matches on or off; it is on when the decoder is created.
     fn set_copybacks_tracking(&mut self, enabled: bool);
 
-    /// Matches shorter than `min_len` bytes are not recorded; 1 when the decoder is created.
+    /// Copybacks shorter than `min_len` bytes, their continuations merged, are not recorded; 1
+    /// when the decoder is created. A copyback enters the queue once it is `min_len` long,
+    /// until then a match that does not continue it drops it. The decoder leaves out the
+    /// matches shorter than the hard threshold it was created with, `hard_min_len`, or
+    /// `min_len` if shorter, but for those that continue the last one reported.
     fn set_copybacks_min_len(&mut self, min_len: u32);
 
     /// Compressed bytes taken from the input so far.
     fn total_in(&self) -> u64;
+
+    /// How far back a match of the stream being decoded can reach at most, as its format or
+    /// header says: the dictionary size of the xz Block (or `.lzma` stream), the window of the
+    /// zstd frame, 32 KiB for gzip, 64 KiB for lz4. The xz and zstd ones are 0 until the first
+    /// header that declares one is decoded, and change with each Block or frame. A caller that
+    /// decodes this far past the bytes it reads knows, along with them, every match that copies
+    /// them.
+    fn window_size(&self) -> u64;
+
+    /// Keeps the window readable too: after [`Self::decode_to`]`(target)`, every byte from
+    /// `target - retain - window_size()` on, the window of the Block or frame being decoded when
+    /// `decode_to` starts. To be called before the first byte is decoded.
+    ///
+    /// # Panics
+    ///
+    /// If a byte was decoded already.
+    fn retain_window(&mut self);
 }
 
 /// The pieces of a range of decoded bytes, in order: see [`InPlaceDecoder::bytes`].

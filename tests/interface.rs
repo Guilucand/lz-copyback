@@ -74,7 +74,7 @@ fn xz_single_stream_decoder_stops_after_the_first_stream() {
     let (a, b) = (data(), common::sample(32, 100_000, 20_000, 2_000).0);
     let encoded = [common::xz_encode(&a, 1 << 20), common::xz_encode(&b, 1 << 20)].concat();
     assert_eq!(full(Codec::Xz, &encoded).out, [&a[..], &b[..]].concat());
-    let mut decoder = XzInPlaceDecoder::new(&encoded[..], 1 << 20);
+    let mut decoder = XzInPlaceDecoder::new(&encoded[..], 1 << 20, u32::MAX);
     assert_eq!(common::drain(&mut decoder, 1 << 16, 0).out, a);
 }
 

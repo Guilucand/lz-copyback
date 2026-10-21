@@ -61,8 +61,8 @@ struct GzipRing {
     crc: crc32fast::Hasher,
     written: usize,
     copybacks: Copybacks,
-    /// The threshold, at least 1 so that entries with literals only, which report a zero
-    /// length, never pass.
+    /// The hard threshold, capped at the copybacks' `min_len`: at least 1, so that entries
+    /// with literals only, which report a zero length, never pass it.
     min_len: u32,
 }
 
@@ -71,7 +71,7 @@ unsafe impl Send for GzipRing {}
 unsafe impl Sync for GzipRing {}
 
 impl GzipRing {
-    fn new(retain: usize) -> Self {
+    fn new(retain: usize, hard_min_len: u32) -> Self {
         let ring_end = HISTORY + retain + CLEAR_STEP + 4 * WRITE_AHEAD + 2 * HISTORY;
         let len = ring_end + WRITE_AHEAD;
         let buffer: Box<[u8]> = vec![0; len].into_boxed_slice();
@@ -92,7 +92,7 @@ impl GzipRing {
             map: RingMap::default(),
             crc: crc32fast::Hasher::new(),
             written: 0,
-            copybacks: Copybacks::new(),
+            copybacks: Copybacks::new(hard_min_len),
             min_len: 1,
         }
     }
@@ -240,8 +240,14 @@ macro_rules! ring_output {
             #[inline(always)]
             fn on_lz_copy(&mut self, dst: *const u8, distance: usize, len: usize) {
                 let ring = &mut *self.0;
-                if len as u32 >= ring.min_len {
-                    let destination = ring.run_start + (dst as usize - ring.run_ptr as usize) as u64;
+                let short = (len as u32) < ring.min_len;
+                // An entry with literals only.
+                if short && len == 0 {
+                    return;
+                }
+                let destination = ring.run_start + (dst as usize - ring.run_ptr as usize) as u64;
+                // A shorter match passes if it continues the last one, its tail.
+                if !short || ring.copybacks.continues(destination, distance as u32) {
                     ring.copybacks.push(destination, distance as u32, len as u32);
                 }
             }
@@ -268,13 +274,16 @@ pub struct GzipInPlaceDecoder<R> {
 
 impl<R: Read> GzipInPlaceDecoder<R> {
     /// Decodes `source`, keeping the last `retain` bytes readable (see [`InPlaceDecoder`]).
-    pub fn new(source: R, retain: usize) -> Self {
+    /// `hard_min_len` is the hard threshold: the decoder itself leaves out the matches
+    /// shorter than it, or than the copybacks' `min_len` if shorter, but for those continuing
+    /// the last one reported (see [`InPlaceDecoder::set_copybacks_min_len`]).
+    pub fn new(source: R, retain: usize, hard_min_len: u32) -> Self {
         Self {
             source,
             input: DeflateChunkedBufferInput::new_push(IN_PLACE_INPUT_SIZE),
             tables: libdeflate_alloc_decode_tables(),
             gzip: LibdeflateGzipDecompressor::new(),
-            ring: GzipRing::new(retain),
+            ring: GzipRing::new(retain, hard_min_len),
             retain,
             total_in: 0,
             finished: false,
@@ -292,7 +301,7 @@ impl<R: Read> GzipInPlaceDecoder<R> {
         loop {
             let ring = &mut self.ring;
             let result = if ring.copybacks.tracking {
-                ring.min_len = ring.copybacks.min_len.max(1);
+                ring.min_len = ring.copybacks.hard_min_len();
                 self.gzip.decompress(&mut self.tables, &mut self.input, &mut Tracked(ring))
             } else {
                 self.gzip.decompress(&mut self.tables, &mut self.input, &mut Untracked(ring))
@@ -394,5 +403,18 @@ impl<R: Read> InPlaceDecoder for GzipInPlaceDecoder<R> {
 
     fn total_in(&self) -> u64 {
         self.total_in
+    }
+
+    fn window_size(&self) -> u64 {
+        HISTORY as u64
+    }
+
+    fn retain_window(&mut self) {
+        assert_eq!(self.ring.decoded(), 0, "gzip: the window is retained from the first byte only");
+        self.retain += HISTORY;
+        // A larger ring, with the decoder's copybacks swapped in.
+        let mut ring = GzipRing::new(self.retain, 0);
+        std::mem::swap(&mut ring.copybacks, &mut self.ring.copybacks);
+        self.ring = ring;
     }
 }

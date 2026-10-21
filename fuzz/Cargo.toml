@@ -19,7 +19,7 @@ lz4 = "1.28.1"
 # zlib-rs, a port of zlib: miniz_oxide (the default) takes a distance reaching before the start
 # of a member, as streaming-libdeflate-rs does, so it could not tell a wrong byte there.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
-streaming-libdeflate-rs = "0.3.0"
+streaming-libdeflate-rs = "0.3.1"
 
 # Not part of lz-copyback's workspace.
 [workspace]

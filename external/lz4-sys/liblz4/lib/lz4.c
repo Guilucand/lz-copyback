@@ -712,9 +712,9 @@ unsigned LZ4_count(const BYTE* pIn, const BYTE* pMatch, const BYTE* pInLimit)
 #else
 #  define LZ4_LZ_TLS __thread
 #endif
-static LZ4_LZ_TLS const LZ4_lzHookState* LZ4_lzHookTls = NULL;
+static LZ4_LZ_TLS LZ4_lzHookState* LZ4_lzHookTls = NULL;
 
-void LZ4_setLzHookState(const LZ4_lzHookState* state) { LZ4_lzHookTls = state; }
+void LZ4_setLzHookState(LZ4_lzHookState* state) { LZ4_lzHookTls = state; }
 
 
 /*-************************************
@@ -2028,11 +2028,19 @@ read_variable_length(const BYTE** ip, const BYTE* ilimit,
 
 /* ggcat LZ hook: report the match of `length` bytes written at `op`, `offset` bytes back,
  * once, before it is copied. Every match goes through exactly one report site.
- * `lzMinLength` is SIZE_MAX without a hook, so a match costs a single comparison. */
+ * `lzMinLength` is SIZE_MAX without a hook, so a match costs a comparison and a test. A
+ * shorter match is reported if it continues the last one reported, from where it ended at
+ * the same offset: the tail of a repeat cut into matches. */
 #define LZ4_LZ_REPORT(op, offset, length) do { \
-    if (unlikely((size_t)(length) >= lzMinLength)) \
-        lzHook->hook(lzHook->ctx, lzHook->base + (unsigned long long)((op) - (BYTE*)dst), \
-                     (unsigned)(offset), (unsigned)(length)); \
+    if (unlikely((size_t)(length) >= lzMinLength || lzHook != NULL)) { \
+        unsigned long long const lzDst_ = lzHook->base + (unsigned long long)((op) - (BYTE*)dst); \
+        if ((size_t)(length) >= lzMinLength \
+                || (lzDst_ == lzHook->lastEnd && (unsigned)(offset) == lzHook->lastOffset)) { \
+            lzHook->hook(lzHook->ctx, lzDst_, (unsigned)(offset), (unsigned)(length)); \
+            lzHook->lastEnd = lzDst_ + (length); \
+            lzHook->lastOffset = (unsigned)(offset); \
+        } \
+    } \
 } while (0)
 
 /*! LZ4_decompress_generic() :
@@ -2068,7 +2076,7 @@ LZ4_decompress_generic(
 
         const int checkOffset = (dictSize < (int)(64 KB));
 
-        const LZ4_lzHookState* const lzHook = LZ4_lzHookTls;
+        LZ4_lzHookState* const lzHook = LZ4_lzHookTls;
         const size_t lzMinLength = (lzHook != NULL) ? (size_t)lzHook->minLength : (size_t)-1;
 
 

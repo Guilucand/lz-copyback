@@ -1,14 +1,19 @@
 //! The copyback contract, checked on each of the four decoders: the output is unchanged,
-//! every copyback is a correct raw match pushed no later than its first byte, the list does
-//! not depend on how far each `decode_to` goes, and the threshold and the tracking switch
-//! behave.
+//! every copyback is a correct repeat pushed no later than its first byte, the matches
+//! continuing one another merged into it, the list does not depend on how far each
+//! `decode_to` goes, and the threshold and the tracking switch behave.
 
 mod common;
 
-use common::{Codec, Drained, check_copybacks, covers, decoder, drain, full, read_out, sample};
+use common::{
+    Codec, Drained, check_copybacks, continues, covers, decoder, decoder_hard, drain, drain_min, full, gzip_encode,
+    lz4_encode,
+    merged, read_out, sample, xz_encode, zstd_encode,
+};
 use lz_copyback::Copyback;
 
-/// The longest match each format can encode in one raw match, when it has a limit.
+/// The longest match each format can encode, when it has a limit: a longer repeat is cut into
+/// matches, which the decoders merge back.
 const XZ_MAX_MATCH: u32 = 273;
 const DEFLATE_MAX_MATCH: u32 = 258;
 
@@ -31,7 +36,7 @@ macro_rules! codec_tests {
             }
 
             #[test]
-            fn output_is_unchanged_and_copybacks_are_correct_raw_matches() {
+            fn output_is_unchanged_and_copybacks_are_correct_repeats() {
                 let case = case();
                 let drained = full(case.codec, &case.encoded);
                 assert_eq!(drained.out, case.data);
@@ -41,8 +46,19 @@ macro_rules! codec_tests {
                 assert!(covers(&drained.copybacks, src, dst, len, 0.9), "planted repeat not found");
                 if let Some(max) = case.max_match {
                     let longest = drained.copybacks.iter().map(|c| c.len).max().unwrap();
-                    assert!(longest <= max, "a raw match of {longest} bytes: merged or misreported");
+                    assert!(longest > max, "the matches of the planted repeat were not merged: {longest} bytes");
                 }
+            }
+
+            #[test]
+            fn matches_continuing_the_last_copyback_extend_it() {
+                let case = case();
+                let mut decoder = decoder(case.codec, &case.encoded, 1 << 20);
+                // Nothing taken out of the queue: every continuation finds its copyback there.
+                assert_eq!(read_out(&mut *decoder, 1 << 16), case.data);
+                let all: Vec<Copyback> = decoder.peek_copybacks().iter().copied().collect();
+                check_copybacks(&case.data, &all);
+                assert!(!all.windows(2).any(|pair| continues(&pair[0], &pair[1])), "a continuation not merged");
             }
 
             #[test]
@@ -52,19 +68,33 @@ macro_rules! codec_tests {
                 for (chunk, ahead) in [(7, 0), (7, 4099), (4099, 1 << 16), (1 << 20, 0)] {
                     let drained = drain(&mut *decoder(case.codec, &case.encoded, chunk + ahead), chunk, ahead);
                     assert_eq!(drained.out, case.data, "chunk {chunk}, ahead {ahead}");
-                    assert!(drained.copybacks == reference, "chunk {chunk}, ahead {ahead} changed the copybacks");
+                    // Taken out at other times, the queue merged other continuations.
+                    assert!(merged(&drained.copybacks) == merged(&reference), "chunk {chunk}, ahead {ahead} changed the copybacks");
                 }
             }
 
             #[test]
-            fn min_len_filters_the_raw_matches() {
+            fn min_len_filters_the_merged_copybacks() {
                 let case = case();
-                let all = full(case.codec, &case.encoded).copybacks;
+                let all = merged(&full(case.codec, &case.encoded).copybacks);
                 for min_len in [4, 40, 300] {
                     let mut decoder = decoder(case.codec, &case.encoded, 1 << 20);
-                    decoder.set_copybacks_min_len(min_len);
-                    let filtered: Vec<Copyback> = all.iter().copied().filter(|c| c.len >= min_len).collect();
-                    assert!(drain(&mut *decoder, 1 << 16, 0).copybacks == filtered, "min_len {min_len}");
+                    let filtered = drain_min(&mut *decoder, 1 << 16, 0, min_len).copybacks;
+                    // The planted repeat, longer than any match a format writes, passes merged.
+                    let (src, dst, len) = case.planted;
+                    assert!(covers(&filtered, src, dst, len, 0.9), "min_len {min_len}: planted repeat not found");
+                    // Each of at least min_len, or the rest of the one before, taken out of the
+                    // queue as it grew, within a copyback of all the matches.
+                    for (index, copyback) in filtered.iter().enumerate() {
+                        let rest = index > 0 && continues(&filtered[index - 1], copyback);
+                        assert!(copyback.len >= min_len || rest, "{copyback:?} with min_len {min_len}");
+                        let within = all.iter().any(|outer| {
+                            outer.offset == copyback.offset
+                                && outer.destination <= copyback.destination
+                                && copyback.destination + copyback.len as u64 <= outer.destination + outer.len as u64
+                        });
+                        assert!(within, "{copyback:?} with min_len {min_len} is no part of a copyback of all matches");
+                    }
                 }
             }
 
@@ -89,7 +119,12 @@ macro_rules! codec_tests {
                 assert_eq!(read_out(&mut *decoder, 1 << 16), case.data);
                 let after: Vec<Copyback> = decoder.peek_copybacks().iter().copied().collect();
                 assert!(after == before, "the queue changed while tracking was off");
-                assert!(!before.is_empty() && all.starts_with(&before));
+                // All of them merged, but the last, which matches decoded later can extend.
+                let (all, before) = (merged(&all), merged(&before));
+                let (last, earlier) = before.split_last().expect("copybacks recorded");
+                assert!(all.starts_with(earlier));
+                let next = &all[earlier.len()];
+                assert!((last.destination, last.offset) == (next.destination, next.offset) && last.len <= next.len);
             }
         }
     };
@@ -199,4 +234,29 @@ fn xz_blocks_behind_a_bcj_filter_report_nothing() {
     check_copybacks(&drained.out, &drained.copybacks);
     let end = drained.copybacks.last().map(|c| c.destination + c.len as u64).unwrap();
     assert!(end <= plain.len() as u64, "the filtered stream reported copybacks");
+}
+
+/// The tail of a repeat cut into matches is kept however short, below the hard threshold too: the
+/// copyback of a planted repeat runs to its end. The lengths leave xz's and deflate's last match
+/// of all sizes, those under the hard threshold (128 bytes) included.
+#[test]
+fn the_tails_of_repeats_are_kept_however_short() {
+    for codec in [Codec::Xz, Codec::Gzip, Codec::Zstd, Codec::Lz4] {
+        for len in (2000..2600).step_by(23) {
+            let (data, (src, dst, len)) = sample(7, 120_000, 30_000, len);
+            let encoded = match codec {
+                Codec::Xz => xz_encode(&data, 1 << 20),
+                Codec::Gzip => gzip_encode(&data, 6),
+                Codec::Zstd => zstd_encode(&data, 20),
+                Codec::Lz4 => lz4_encode(&data, true, ::lz4::BlockSize::Max64KB),
+            };
+            let copybacks = drain_min(&mut *decoder_hard(codec, &encoded, 1 << 20, 128), 1 << 16, 0, 128).copybacks;
+            // Random bytes follow the repeat, so its copyback ends with it, or a byte or two later.
+            let end = dst + len;
+            assert!(
+                copybacks.iter().any(|c| c.offset as u64 == dst - src && c.destination + c.len as u64 >= end),
+                "{codec:?}, len {len}: the repeat's copyback stops before its end"
+            );
+        }
+    }
 }

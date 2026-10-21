@@ -22,9 +22,10 @@ All four decoders implement the `InPlaceDecoder` trait:
 ```rust
 use lz_copyback::{InPlaceDecoder, xz::XzInPlaceDecoder};
 
-// Keeps the last 1 MiB + 64 KiB readable behind what it was asked to decode.
-let mut decoder = XzInPlaceDecoder::new_multi_decoder(file, (1 << 20) + (64 << 10));
-decoder.set_copybacks_min_len(62);
+// Keeps the last 1 MiB + 64 KiB readable behind what it was asked to decode, and leaves out,
+// in C, the matches shorter than 128 bytes that do not continue the last one.
+let mut decoder = XzInPlaceDecoder::new_multi_decoder(file, (1 << 20) + (64 << 10), 128);
+decoder.set_copybacks_min_len(128);
 let mut position = 0;
 loop {
     // A chunk of 64 KiB, with every copyback up to 1 MiB past it.
@@ -48,6 +49,12 @@ loop {
   what was decoded is readable with `bytes` (in more than one piece where the ring wraps),
   until the next `decode_to`. The ring is sized for it: liblzma's dictionary is at least
   `retain` + 1 MiB, the other rings `retain` plus a few blocks.
+* **The window.** `window_size()` is how far back a match can reach: the xz Block's
+  dictionary size, the zstd frame's window (both 0 until their header is decoded), 32 KiB for
+  gzip, 64 KiB for lz4. A caller that decodes that far past the bytes it reads knows every
+  match copying them as it reads them. `retain_window()`, before the first byte is decoded,
+  keeps `retain + window_size()` bytes readable instead, the dictionary or ring growing to
+  match.
 * **Steps.** `decode_to` may decode up to a block past `target` (zstd, lz4) or a few hundred
   bytes (gzip); xz stops exactly there. The output and the copybacks do not depend on how far
   each step goes.
@@ -78,16 +85,29 @@ pub struct Copyback {
 }
 ```
 
-The decoder only ever pushes to the back of the queue; removing entries is up to the caller.
+The decoder only pushes to the back of the queue, or extends its last entry; removing entries
+is up to the caller.
 
-* **Raw matches.** Every match exactly as the decoder decoded it: never merged with the next
-  one, never clipped, never split. A long repeat is as many matches as the compressor
-  wrote (deflate stops at 258 bytes, LZMA at 273), and a match may overlap its own output
-  (`len > offset`, a periodic repeat). `set_copybacks_min_len` filters on this raw length.
+* **Continuations merged.** A long repeat comes as many matches, as the compressor cuts it
+  (deflate stops at 258 bytes, LZMA at 273). A match at the same offset as the queue's last
+  entry, starting where that one ends, extends it instead of being pushed, so the repeat is
+  one copyback, as long as that entry stays in the queue: the continuation of one the caller
+  removed comes as an entry of its own, however short. A caller that already read the last
+  entry finds it longer once it grows. Matches are never clipped or split, and a match may overlap
+  its own output (`len > offset`, a periodic repeat).
+* **Two thresholds.** `set_copybacks_min_len` filters copybacks on their merged length: one
+  shorter is kept out of the queue until it reaches it, and dropped when a match that does
+  not continue it comes. To spare a call for every short match, the decoders themselves, in
+  C for xz, zstd and lz4, leave out the matches shorter than the hard threshold each
+  constructor takes, `hard_min_len` (or than `min_len` if it is shorter), but for a match
+  that continues the last one reported, so the tail of a repeat is kept however short. A
+  repeat cut into matches whose first one is that short starts at the next one. A hard
+  threshold of 1 hands every match to the queue, which then filters on the merged length
+  alone, at a few ns per match.
 * **Absolute destinations,** counted from the first byte the decoder produced, across
   concatenated xz streams, zstd frames and gzip members.
 * **No later than the bytes.** A copyback is in the queue by the time the `decode_to` call
-  that decodes its first destination byte returns:
+  that decodes its first `min_len` destination bytes returns:
 
   | codec | when a match is pushed |
   |---|---|

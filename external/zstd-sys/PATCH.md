@@ -42,8 +42,11 @@ That takes the archive from 581 exported symbols to 348. A legacy v0.x frame is 
   `lzHookMinLen` in `ZSTD_DCtx_s`; the `ZSTD_LZ_HOOK(dctx, ostart, op, seq)` macro reporting
   `lzTotalOut + (op - ostart) + seq.litLength`, `seq.offset` (the resolved distance) and
   `seq.matchLength` when the match is at least `lzHookMinLen` long (`SIZE_MAX` without a
-  hook, so a sequence costs one comparison and the short matches never leave C);
-  prototypes of `ZSTD_DCtx_setLzMatchHook(dctx, hook, ctx, minLength)` and
+  hook, so a sequence costs a comparison and a NULL check, and the short matches never leave
+  C), or when it continues the last match reported, from `lzHookLastEnd` at distance
+  `lzHookLastOffset`, which it then updates, so the tail of a repeat cut into matches is
+  kept however short; prototypes of
+  `ZSTD_DCtx_setLzMatchHook(dctx, hook, ctx, minLength, lastEnd, lastOffset)` and
   `ZSTD_DCtx_getLzTotalOut`.
 * `zstd/lib/decompress/zstd_decompress_block.c`: the macro at the eight sequence execution
   sites (`ZSTD_decompressSequences_bodySplitLitBuffer` x3, `ZSTD_decompressSequences_body`

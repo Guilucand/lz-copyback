@@ -989,6 +989,8 @@ out:
 	// NOTE: Must not copy dict.limit.
 	dictptr->pos = dict.pos;
 	dictptr->full = dict.full;
+	dictptr->hook_last_end = dict.hook_last_end;
+	dictptr->hook_last_distance = dict.hook_last_distance;
 
 	rc_from_local(coder->rc, *in_pos);
 

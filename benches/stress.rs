@@ -121,11 +121,12 @@ fn stock(codec: Codec, encoded: &[u8], len: usize) -> f64 {
 fn in_place(codec: Codec, encoded: &[u8], len: usize, chunk: usize, window: usize) -> f64 {
     let retain = chunk + window;
     let start = Instant::now();
+    // The hard threshold at the soft one, which is set below: the decoders filter at min_len.
     let mut decoder: Box<dyn InPlaceDecoder> = match codec {
-        Codec::Xz => Box::new(lz_copyback::xz::XzInPlaceDecoder::new_multi_decoder(encoded, retain)),
-        Codec::Zstd => Box::new(lz_copyback::zstd::ZstdInPlaceDecoder::new(encoded, retain).unwrap()),
-        Codec::Lz4 => Box::new(lz_copyback::lz4::Lz4InPlaceDecoder::new(encoded, retain).unwrap()),
-        Codec::Gzip => Box::new(lz_copyback::gzip::GzipInPlaceDecoder::new(encoded, retain)),
+        Codec::Xz => Box::new(lz_copyback::xz::XzInPlaceDecoder::new_multi_decoder(encoded, retain, u32::MAX)),
+        Codec::Zstd => Box::new(lz_copyback::zstd::ZstdInPlaceDecoder::new(encoded, retain, u32::MAX).unwrap()),
+        Codec::Lz4 => Box::new(lz_copyback::lz4::Lz4InPlaceDecoder::new(encoded, retain, u32::MAX).unwrap()),
+        Codec::Gzip => Box::new(lz_copyback::gzip::GzipInPlaceDecoder::new(encoded, retain, u32::MAX)),
     };
     decoder.set_copybacks_min_len(62);
     let mut position = 0u64;

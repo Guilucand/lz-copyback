@@ -147,6 +147,10 @@ struct ZSTD_DCtx_s
     void (*lzHook)(void* ctx, unsigned long long dstAbs, unsigned distance, unsigned matchLength);
     void* lzHookCtx;
     size_t lzHookMinLen;
+    /* Where the destination of the last match reported ends, and its distance: a match
+     * continuing it is reported whatever its length (the tail of a repeat cut into matches). */
+    U64 lzHookLastEnd;
+    unsigned lzHookLastOffset;
     blockType_e bType;            /* used in ZSTD_decompressContinue(), store blockType between block header decoding and block decompression stages */
     ZSTD_dStage stage;
     U32 litEntropy;
@@ -249,17 +253,25 @@ void ZSTD_checkContinuity(ZSTD_DCtx* dctx, const void* dst, size_t dstSize);
 /* ggcat LZ hook: report one sequence's match, with its full length, right after
  * the sequence is executed and before the output cursor moves past it. `op` is
  * the block output cursor, `ostart` the block start; the match destination is
- * lzTotalOut + (op - ostart) + litLength and `offset` is the resolved distance. */
+ * lzTotalOut + (op - ostart) + litLength and `offset` is the resolved distance.
+ * A match shorter than lzHookMinLen is reported only if it continues the last one
+ * reported, from where it ended at the same distance. */
 #define ZSTD_LZ_HOOK(dctx, ostart, op, seq) do { \
-    if ((seq).matchLength >= (dctx)->lzHookMinLen) \
-        (dctx)->lzHook((dctx)->lzHookCtx, \
-            (unsigned long long)(dctx)->lzTotalOut + (unsigned long long)((op) - (ostart)) + (unsigned long long)(seq).litLength, \
-            (unsigned)(seq).offset, (unsigned)(seq).matchLength); \
+    if ((seq).matchLength >= (dctx)->lzHookMinLen || (dctx)->lzHook != NULL) { \
+        unsigned long long const lzDst_ = (unsigned long long)(dctx)->lzTotalOut \
+            + (unsigned long long)((op) - (ostart)) + (unsigned long long)(seq).litLength; \
+        if ((seq).matchLength >= (dctx)->lzHookMinLen \
+                || (lzDst_ == (dctx)->lzHookLastEnd && (unsigned)(seq).offset == (dctx)->lzHookLastOffset)) { \
+            (dctx)->lzHook((dctx)->lzHookCtx, lzDst_, (unsigned)(seq).offset, (unsigned)(seq).matchLength); \
+            (dctx)->lzHookLastEnd = lzDst_ + (seq).matchLength; \
+            (dctx)->lzHookLastOffset = (unsigned)(seq).offset; \
+        } \
+    } \
 } while (0)
 
 ZSTDLIB_API void ZSTD_DCtx_setLzMatchHook(ZSTD_DCtx* dctx,
         void (*hook)(void* ctx, unsigned long long dstAbs, unsigned distance, unsigned matchLength),
-        void* ctx, unsigned minLength);
+        void* ctx, unsigned minLength, unsigned long long lastEnd, unsigned lastOffset);
 ZSTDLIB_API unsigned long long ZSTD_DCtx_getLzTotalOut(const ZSTD_DCtx* dctx);
 
 #endif /* ZSTD_DECOMPRESS_INTERNAL_H */

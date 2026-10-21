@@ -24,13 +24,17 @@ extern "C" {
     /// Installs `hook` for the calling thread, for every `lzma_code` call until it is
     /// cleared with `None`. `out_abs_base` is the absolute stream offset of the first byte
     /// the next `lzma_code` call writes; matches shorter than `min_len` bytes are not
-    /// reported.
+    /// reported, but for one whose destination starts at `last_end`, at distance
+    /// `last_distance`: where the last match reported ended, which the decoder follows from
+    /// there on, within the call.
     #[link_name = "lzcb_lzma_lz_set_match_hook"]
     pub fn lzma_lz_set_match_hook(
         hook: lzma_lz_match_hook,
         ctx: *mut libc::c_void,
         out_abs_base: u64,
         min_len: u32,
+        last_end: u64,
+        last_distance: u32,
     );
 
     /// Installs the calling thread's in-place state, for every `lzma_code` call until it is
@@ -58,6 +62,12 @@ extern "C" {
 pub struct lzma_lz_in_place {
     /// Set by the caller: the smallest dictionary allocated.
     pub min_size: usize,
+    /// Set by the caller: the dictionary is also larger than `min_size` by the dictionary size
+    /// the stream declares, as the caller keeps that much more readable.
+    pub min_size_plus_dict: bool,
+    /// The dictionary size the block being decoded declares, the longest distance of its
+    /// matches (rounded up as the dictionary is allocated); 0 before the LZ decoder starts.
+    pub dict_size: usize,
     /// The current dictionary, with `size` usable bytes.
     pub buf: *mut u8,
     pub size: usize,

@@ -33,11 +33,16 @@ wasm shim: its `#[no_mangle]` allocator functions would collide with the genuine
   shortcut (whose `length` does not include `MINMATCH` yet), and the safe loop's general
   path at `safe_match_copy` (after the offset check), which also takes the matches the fast
   loop sends there. A block is decoded whole, so a match is never split.
-* `liblz4/lib/lz4frame.{c,h}`: `lzTotalOut`, `lzHook`, `lzHookCtx` and `lzHookMinLength` in `LZ4F_dctx`
-  (zeroed by the context's allocation, never reset, so the offsets run on across frames);
-  `LZ4F_setLzMatchHook(dctx, hook, ctx, minLength)`; `LZ4F_decompressBlock()`, which
-  publishes `{hook, ctx, base = lzTotalOut, minLength}` around both block decodes and counts
-  their output;
+* `liblz4/lib/lz4frame.{c,h}`: `lzTotalOut`, `lzHook`, `lzHookCtx`, `lzHookMinLength`,
+  `lzHookLastEnd` and `lzHookLastOffset` in `LZ4F_dctx` (zeroed by the context's allocation,
+  never reset, so the offsets run on across frames);
+  `LZ4F_setLzMatchHook(dctx, hook, ctx, minLength, lastEnd, lastOffset)`;
+  `LZ4F_decompressBlock()`, which publishes
+  `{hook, ctx, base = lzTotalOut, minLength, lastEnd, lastOffset}` around both block decodes,
+  takes the last match's end and offset back after them, and counts their output. A match
+  shorter than `minLength` is reported when it continues the last one reported, from
+  `lastEnd` at the same offset, so the tail of a repeat cut into matches is kept however
+  short;
   uncompressed blocks are counted in `dstage_copyDirect`. When the caller's buffer is
   smaller than a block, the block is decoded into `tmpOut` and flushed over later calls, so
   its matches are reported up to one block before their bytes reach the caller. Linked-block

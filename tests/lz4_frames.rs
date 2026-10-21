@@ -80,7 +80,7 @@ fn reported_matches_are_exactly_the_frame_sequences() {
             assert_eq!(size, data.len() as u64);
             assert!(!expected.is_empty());
             for (chunk, ahead) in [(7, 0), (1 << 16, 1 << 20), (8 << 20, 0)] {
-                let mut decoder = lz_copyback::lz4::Lz4InPlaceDecoder::new(&encoded[..], chunk + ahead).unwrap();
+                let mut decoder = lz_copyback::lz4::Lz4InPlaceDecoder::new(&encoded[..], chunk + ahead, u32::MAX).unwrap();
                 let drained = common::drain(&mut decoder, chunk, ahead);
                 assert_eq!(drained.out, data);
                 assert!(
