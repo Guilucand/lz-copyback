@@ -84,9 +84,9 @@ unsafe impl<R: Send> Send for Lz4InPlaceDecoder<R> {}
 
 impl<R: Read> Lz4InPlaceDecoder<R> {
     /// Decodes the lz4 frame read from `reader`, keeping the last `retain` bytes readable
-    /// (see [`InPlaceDecoder`]). `hard_min_len` is the hard threshold: the decoder itself leaves out the matches
-    /// shorter than it, or than the copybacks' `min_len` if shorter, but for those continuing
-    /// the last one reported (see [`InPlaceDecoder::set_copybacks_min_len`]).
+    /// (see [`InPlaceDecoder`]). `hard_min_len` is the hard threshold: the decoder itself leaves
+    /// out the matches shorter than it, or than the copybacks' `min_len` if shorter, but for
+    /// those continuing the last one reported (see [`InPlaceDecoder::set_copybacks_min_len`]).
     pub fn new(reader: R, retain: usize, hard_min_len: u32) -> io::Result<Self> {
         let mut context = ffi::LZ4FDecompressionContext(ptr::null_mut());
         check(unsafe { ffi::LZ4F_createDecompressionContext(&mut context, ffi::LZ4F_VERSION) })?;
@@ -153,7 +153,7 @@ impl<R: Read> Lz4InPlaceDecoder<R> {
         let track = self.copybacks.tracking;
         if track {
             let (min_len, last_end, last_offset) =
-                (self.copybacks.hard_min_len(), self.copybacks.last_end, self.copybacks.last_offset);
+                (self.copybacks.report_min_len(), self.copybacks.last_end, self.copybacks.last_offset);
             let ctx = self.copybacks.hook_ctx();
             unsafe {
                 ffi::LZ4F_setLzMatchHook(self.context.0, Some(copyback_hook), ctx, min_len, last_end, last_offset)

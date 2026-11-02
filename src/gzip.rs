@@ -248,7 +248,7 @@ macro_rules! ring_output {
                 let destination = ring.run_start + (dst as usize - ring.run_ptr as usize) as u64;
                 // A shorter match passes if it continues the last one, its tail.
                 if !short || ring.copybacks.continues(destination, distance as u32) {
-                    ring.copybacks.push(destination, distance as u32, len as u32);
+                    ring.copybacks.record_match(destination, distance as u32, len as u32);
                 }
             }
         }
@@ -301,7 +301,7 @@ impl<R: Read> GzipInPlaceDecoder<R> {
         loop {
             let ring = &mut self.ring;
             let result = if ring.copybacks.tracking {
-                ring.min_len = ring.copybacks.hard_min_len();
+                ring.min_len = ring.copybacks.report_min_len();
                 self.gzip.decompress(&mut self.tables, &mut self.input, &mut Tracked(ring))
             } else {
                 self.gzip.decompress(&mut self.tables, &mut self.input, &mut Untracked(ring))

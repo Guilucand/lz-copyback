@@ -1,13 +1,14 @@
 //! The lz4 decoder must report exactly the matches its frame encodes: every sequence of
-//! every compressed block, once, whole, at its position in the output. The format is simple
+//! every compressed block, once, whole, at its position in the output, but cut into pieces of
+//! its offset if it overlaps its own output, as the queue holds them. The format is simple
 //! enough to read them straight from the compressed bytes, independently of liblz4.
 
 mod common;
 
 use lz_copyback::Copyback;
 
-/// Every match of a single lz4 frame, as `(destination, offset, len)`, and the frame's
-/// decoded size.
+/// Every match of a single lz4 frame, as `(destination, offset, len)`, cut into pieces of at
+/// most `offset` bytes, and the frame's decoded size.
 fn frame_matches(frame: &[u8]) -> (Vec<Copyback>, u64) {
     fn length(block: &[u8], i: &mut usize, mut value: usize) -> usize {
         if value == 15 {
@@ -63,8 +64,12 @@ fn frame_matches(frame: &[u8]) -> (Vec<Copyback>, u64) {
             let offset = u16::from_le_bytes([block[i], block[i + 1]]) as u32;
             i += 2;
             let len = length(block, &mut i, (token & 15) as usize) + 4;
-            matches.push(Copyback { destination: pos, offset, len: len as u32 });
-            pos += len as u64;
+            let end = pos + len as u64;
+            while pos < end {
+                let piece = (end - pos).min(offset as u64);
+                matches.push(Copyback { destination: pos, offset, len: piece as u32 });
+                pos += piece;
+            }
         }
     }
     (matches, pos)

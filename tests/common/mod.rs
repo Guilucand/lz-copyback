@@ -119,15 +119,16 @@ pub fn read_out(decoder: &mut dyn InPlaceDecoder, chunk: usize) -> Vec<u8> {
     }
 }
 
-/// The invariants of every list of raw matches: in stream order, destinations never
-/// overlapping, each a correct repeat of earlier output (byte by byte, so an overlapping,
-/// periodic match is checked as it is decoded).
+/// The invariants of every list of copybacks: in stream order, destinations never
+/// overlapping, each a correct repeat of earlier output whose source ends before its
+/// destination starts.
 pub fn check_copybacks(out: &[u8], copybacks: &[Copyback]) {
     let mut next_free = 0;
     for copyback in copybacks {
         let (dst, off, len) = (copyback.destination, copyback.offset as u64, copyback.len as u64);
         assert!(off > 0 && off <= dst, "{copyback:?} has no source in the output");
         assert!(len > 0, "{copyback:?} is empty");
+        assert!(len <= off, "{copyback:?} overlaps its own source");
         assert!(dst >= next_free, "{copyback:?} overlaps the previous destination");
         assert!(dst + len <= out.len() as u64, "{copyback:?} ends past the output");
         for i in dst..dst + len {
@@ -137,10 +138,35 @@ pub fn check_copybacks(out: &[u8], copybacks: &[Copyback]) {
     }
 }
 
-/// `copybacks` with each one continuing the one before, at the same offset, merged into it,
-/// as a decoder merges them while the one before is still in its queue: lists taken out of the
-/// queue at different times compare equal merged.
+/// `copybacks` with each one continuing the one before merged into it, as a decoder merges
+/// them while the one before is still in its queue: up to `offset` bytes in all.
 pub fn merged(copybacks: &[Copyback]) -> Vec<Copyback> {
+    let mut out: Vec<Copyback> = Vec::with_capacity(copybacks.len());
+    for &copyback in copybacks {
+        if let Some(last) = out.last_mut() {
+            if continues(last, &copyback) {
+                last.len += copyback.len;
+                continue;
+            }
+        }
+        out.push(copyback);
+    }
+    out
+}
+
+/// Whether `copyback` continues `before` as the decoder merges it: at the same offset, from
+/// where it ends, the two at most `offset` bytes long in all.
+pub fn continues(before: &Copyback, copyback: &Copyback) -> bool {
+    before.offset == copyback.offset
+        && before.destination + before.len as u64 == copyback.destination
+        && before.len as u64 + copyback.len as u64 <= copyback.offset as u64
+}
+
+/// The chains of `copybacks`: maximal runs with the same offset, each starting where the one
+/// before ends, as one copyback each, which can be longer than its offset: the matches of one
+/// repeat, which the queue holds in pieces of at most `offset` bytes, cut also where the caller
+/// took them out.
+pub fn chains(copybacks: &[Copyback]) -> Vec<Copyback> {
     let mut out: Vec<Copyback> = Vec::with_capacity(copybacks.len());
     for &copyback in copybacks {
         if let Some(last) = out.last_mut() {
@@ -154,9 +180,20 @@ pub fn merged(copybacks: &[Copyback]) -> Vec<Copyback> {
     out
 }
 
-/// Whether `copyback` continues `before`: at the same offset, from where it ends.
-pub fn continues(before: &Copyback, copyback: &Copyback) -> bool {
-    before.offset == copyback.offset && before.destination + before.len as u64 == copyback.destination
+/// Checks that two lists of copybacks of the same stream, taken out of the queue at different
+/// times with the threshold `min_len`, hold the same repeats: their chains pair one to one,
+/// with the same start and offset, and lengths that differ by less than `min_len`, as the rest
+/// of a copyback taken out must reach `min_len` on its own.
+pub fn assert_same_chains_but_tails(found: &[Copyback], reference: &[Copyback], min_len: u32, what: &str) {
+    let (found, reference) = (chains(found), chains(reference));
+    assert_eq!(found.len(), reference.len(), "{what}: not as many chains");
+    for (found, reference) in found.iter().zip(&reference) {
+        assert!(
+            (found.destination, found.offset) == (reference.destination, reference.offset)
+                && found.len.abs_diff(reference.len) < min_len.max(1),
+            "{what}: {found:?} is not the chain {reference:?}"
+        );
+    }
 }
 
 /// Does some copyback repeat at least `min_cover` of the planted `len` bytes at `dst`, at

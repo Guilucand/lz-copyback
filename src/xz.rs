@@ -95,9 +95,10 @@ unsafe extern "C" fn retire(ctx: *mut c_void, buf: *mut u8, _size: usize) {
 }
 
 impl<R: Read> XzInPlaceDecoder<R> {
-    /// Decodes one .xz stream, keeping the last `retain` bytes readable. `hard_min_len` is the hard threshold: the decoder itself leaves out the matches
-    /// shorter than it, or than the copybacks' `min_len` if shorter, but for those continuing
-    /// the last one reported (see [`InPlaceDecoder::set_copybacks_min_len`]).
+    /// Decodes one .xz stream, keeping the last `retain` bytes readable. `hard_min_len` is the
+    /// hard threshold: the decoder itself leaves out the matches shorter than it, or than the
+    /// copybacks' `min_len` if shorter, but for those continuing the last one reported (see
+    /// [`InPlaceDecoder::set_copybacks_min_len`]).
     pub fn new(reader: R, retain: usize, hard_min_len: u32) -> Self {
         Self::with_decoder(reader, retain, hard_min_len, |stream| unsafe {
             ffi::lzma_stream_decoder(stream, u64::MAX, 0)
@@ -245,7 +246,7 @@ impl<R: Read> XzInPlaceDecoder<R> {
         let track = self.copybacks.tracking;
         if track {
             let (min_len, last_end, last_offset) =
-                (self.copybacks.hard_min_len(), self.copybacks.last_end, self.copybacks.last_offset);
+                (self.copybacks.report_min_len(), self.copybacks.last_end, self.copybacks.last_offset);
             let ctx = self.copybacks.hook_ctx();
             unsafe {
                 ffi::lzma_lz_set_match_hook(Some(copyback_hook), ctx, before_out, min_len, last_end, last_offset)

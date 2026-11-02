@@ -41,11 +41,15 @@ pub trait InPlaceDecoder {
     fn bytes_and_copybacks(&mut self, range: Range<u64>)
     -> (Pieces<'_>, &mut VecDeque<Copyback>);
 
-    /// Every copyback recorded so far, in stream order. The decoder only pushes to the back
-    /// of the queue, or extends its last entry with a match that continues it, at the same
-    /// offset, from where it ends: a long repeat cut into matches comes as one entry, as long
-    /// as the last one stays in the queue (the rest of one the caller removed comes as an entry
-    /// of its own, however short). Removing entries is up to the caller.
+    /// Every copyback recorded so far, in stream order, each with `min_len <= len <= offset`
+    /// (see [`Self::set_copybacks_min_len`]): its source ends before its destination starts. The
+    /// decoder only pushes to the back of the queue, or extends its last entry with a match
+    /// that continues it, at the same offset, from where it ends, up to `offset` bytes: a long
+    /// repeat cut into matches comes as one entry per `offset` bytes, as long as the last one
+    /// stays in the queue. The rest of one the caller removed comes as an entry of its own once
+    /// it is `min_len` long, and is lost if the repeat ends before: where the caller removes
+    /// entries can shorten a repeat by less than `min_len`. Removing entries is up to the
+    /// caller.
     fn peek_copybacks(&mut self) -> &mut VecDeque<Copyback>;
 
     /// Turns the recording of LZ matches on or off; it is on when the decoder is created.
@@ -53,9 +57,12 @@ pub trait InPlaceDecoder {
 
     /// Copybacks shorter than `min_len` bytes, their continuations merged, are not recorded; 1
     /// when the decoder is created. A copyback enters the queue once it is `min_len` long,
-    /// until then a match that does not continue it drops it. The decoder leaves out the
-    /// matches shorter than the hard threshold it was created with, `hard_min_len`, or
-    /// `min_len` if shorter, but for those that continue the last one reported.
+    /// until then a match that does not continue it drops it. A match whose offset is shorter
+    /// than its length, which overlaps its own output, comes in pieces of `offset` bytes, so
+    /// one whose offset is shorter than `min_len` is not recorded at all, nor are its
+    /// continuations. The decoder leaves out the matches shorter than the hard threshold it was
+    /// created with, `hard_min_len`, or `min_len` if shorter, but for those that continue the
+    /// last one reported.
     fn set_copybacks_min_len(&mut self, min_len: u32);
 
     /// Compressed bytes taken from the input so far.

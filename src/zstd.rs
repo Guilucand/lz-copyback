@@ -254,7 +254,7 @@ impl<R: Read> ZstdInPlaceDecoder<R> {
         let track = self.copybacks.tracking;
         if track {
             let (min_len, last_end, last_offset) =
-                (self.copybacks.hard_min_len(), self.copybacks.last_end, self.copybacks.last_offset);
+                (self.copybacks.report_min_len(), self.copybacks.last_end, self.copybacks.last_offset);
             let ctx = self.copybacks.hook_ctx();
             unsafe { ffi::ZSTD_DCtx_setLzMatchHook(dctx, Some(copyback_hook), ctx, min_len, last_end, last_offset) };
         }

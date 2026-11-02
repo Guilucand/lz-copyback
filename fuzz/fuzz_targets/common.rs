@@ -211,23 +211,19 @@ pub fn read_checked(decoder: &mut dyn InPlaceDecoder, reading: &Reading, limit: 
     Outcome { out, copybacks, error }
 }
 
-/// The invariants of every list of raw matches: in stream order, destinations never
-/// overlapping, each at least `min_len` bytes (or the rest of the one before, which the reader
-/// took out of the queue while it grew) and a correct repeat of earlier output (byte by
-/// byte, so an overlapping, periodic match is checked as it is decoded), as far as `out` goes.
+/// The invariants of every list of copybacks: in stream order, destinations never
+/// overlapping, each `min_len` bytes at least and its offset at most, so that its source ends
+/// before its destination starts, and a correct repeat of earlier output, as far as `out` goes.
 /// With `sourceless`, a match may reach before the start of the output: streaming-libdeflate-rs
 /// takes a corrupt deflate distance reaching before the stream's start, a known and accepted
 /// behaviour (it copies zeros, within its buffers), which the gzip trailer's checksum rejects.
 pub fn check_copybacks(out: &[u8], copybacks: &[Copyback], min_len: u32, sourceless: bool) {
     let mut next_free = 0;
-    let mut previous: Option<&Copyback> = None;
     for copyback in copybacks {
         let (dst, off, len) = (copyback.destination, copyback.offset as u64, copyback.len as u64);
         assert!(off > 0 && (sourceless || off <= dst), "{copyback:?} has no source in the output");
-        // Shorter only as the rest of the one before, taken out of the queue as it grew.
-        let rest = previous.is_some_and(|p| p.offset == copyback.offset && p.destination + p.len as u64 == dst);
-        assert!(len >= min_len.max(1) as u64 || rest, "{copyback:?} is shorter than {min_len}");
-        previous = Some(copyback);
+        assert!(len >= min_len.max(1) as u64, "{copyback:?} is shorter than {min_len}");
+        assert!(len <= off, "{copyback:?} overlaps its own source");
         assert!(dst >= next_free, "{copyback:?} overlaps the previous destination");
         next_free = dst + len;
         if off > dst {

@@ -1,12 +1,12 @@
 //! The rings: the decoders read what the stock decoders do, a chunk at a time with a window
-//! of look-ahead, with the retained bytes readable after every step and copybacks that do not
-//! depend on the step, while the rings wrap around, across frames, members, blocks, filters
-//! and dictionary sizes.
+//! of look-ahead, with the retained bytes readable after every step and copybacks that depend
+//! on the step only at the tails of repeats, while the rings wrap around, across frames,
+//! members, blocks, filters and dictionary sizes.
 
 mod common;
 
 use common::{
-    Codec, check_copybacks, decoder, fasta, merged, gzip_encode, lz4_encode, plant, random_bytes, xz_encode, xz_encode_bcj, zstd_encode,
+    Codec, assert_same_chains_but_tails, check_copybacks, decoder, fasta, gzip_encode, lz4_encode, plant, random_bytes, xz_encode, xz_encode_bcj, zstd_encode,
 };
 use lz_copyback::lz4::Lz4InPlaceDecoder;
 use lz_copyback::xz::XzInPlaceDecoder;
@@ -67,7 +67,8 @@ fn read_in_place(decoder: &mut dyn InPlaceDecoder, expected: &[u8], chunk: usize
 }
 
 /// The decoder of `codec` reads what the stock one does, for several chunk and look-ahead
-/// sizes, with copybacks that are correct raw matches and the same for all of them.
+/// sizes, with copybacks that are correct repeats, of the same chains for all of them but for
+/// their tails.
 fn check(codec: Codec, encoded: &[u8]) {
     check_with(codec, encoded, &[(64 << 10, 1 << 20), (4096, 64 << 10), (1, 1000)]);
 }
@@ -84,9 +85,10 @@ fn check_with(codec: Codec, encoded: &[u8], sizes: &[(usize, usize)]) {
                 check_copybacks(&expected, &found);
                 reference = Some(found);
             }
-            // Taken out at other times, the queue merged other continuations.
+            // Taken out at other times, the queue split other pieces, and lost other tails.
             Some(reference) => {
-                assert!(merged(&found) == merged(reference), "chunk {chunk}, ahead {ahead}: the copybacks differ")
+                check_copybacks(&expected, &found);
+                assert_same_chains_but_tails(&found, reference, MIN_LEN, &format!("chunk {chunk}, ahead {ahead}"))
             }
         }
     }
